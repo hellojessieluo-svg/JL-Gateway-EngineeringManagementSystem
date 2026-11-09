@@ -10,36 +10,59 @@ under the stage -- every document belongs to a stage:
 
 A project without a registered short name falls back to its ID as the folder name; intake
 that belongs to no project goes to `_general\`.
+
+Every folder name here is read from the local config (common.config.Folders): the names above
+are only the defaults. Nothing that computes a path may spell a folder name itself -- ask
+names() / files() (decided 2026-11-09).
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
+from common.config import AppConfig, Files, Folders, active
 
-GENERIC_FOLDER = "_general"
-INBOX_FOLDER = "inbox"
-OUTBOX_FOLDER = "outbox"
-POOL_FOLDER = "current"
-WITHDRAWN_FOLDER = "_withdrawn"
-# Where this project's glue scripts live (spec section 2). A tool's own run logs and caches
-# are part of it; the health check does not report .log files under this tree (2026-09-11).
-TOOLS_FOLDER = "tools"
-# The fourth position under a stage: process files, dropped drafts, old material (spec section 2).
-# Unrelated to the ledger's "archive" flag (intakes/issues.archived): since 2026-09-08 that
-# flag is only a mark and never moves files.
-ARCHIVE_FOLDER = "archive"
-# Where change-notes drafts live at the library root (2026-09-26): one
-# <id>-<stage>-change-notes.md per draft; once an issue is filed and the copy in the batch
-# matches byte for byte, the program deletes the draft.
-# Not the same as the root's .tmp\ -- that one is the gates' copy area and should always be empty.
-DRAFT_FOLDER = "_drafts"
+
+def config() -> AppConfig:
+    return active()
+
+
+def names() -> Folders:
+    """Folder names of this library."""
+    return active().folders
+
+
+def files() -> Files:
+    """File names of this library."""
+    return active().files
+
+
+def stages() -> tuple[str, ...]:
+    return active().stages
+
+
+def stage_separator() -> str:
+    return active().stage_separator
+
+
+def split_stages(text: str) -> list[str]:
+    """projects.stages as a list."""
+    return [x for x in str(text or "").split(stage_separator()) if x]
+
+
+def join_stages(items) -> str:
+    return stage_separator().join(items)
+
+
+def fallback_stage() -> str:
+    """Where an old record with no stage is filed (withdrawn files and the like)."""
+    return active().last_resort_stage
 
 
 def folder_in_connection(connection: sqlite3.Connection, project_id: str) -> str:
     """A project room's folder name. Not found (old ledger, not registered) falls back to the ID."""
     if not project_id:
-        return GENERIC_FOLDER
+        return names().general
     try:
         row = connection.execute(
             "SELECT folder FROM projects WHERE project_id = ? COLLATE NOCASE",
@@ -49,6 +72,35 @@ def folder_in_connection(connection: sqlite3.Connection, project_id: str) -> str
         return project_id
     folder = row["folder"] if row else ""
     return str(folder) if folder else project_id
+
+
+def locate_in_pool(
+    connection: sqlite3.Connection, root: Path | str, path: Path | str
+) -> tuple[str, str] | None:
+    """The other way round: which project and stage's current folder this file is under.
+    Returns (project ID, stage).
+
+    Only the shape <root>\\<short name>\\<stage>\\current\\... counts; the short name is
+    matched against projects.folder, and rooms without one by project ID. Anything outside
+    that shape, or a room that cannot be recognized, returns None.
+    """
+    try:
+        relative = Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return None
+    parts = relative.parts
+    if len(parts) < 4 or parts[2] != names().current:
+        return None
+    house, stage = parts[0], parts[1]
+    try:
+        rows = connection.execute("SELECT project_id, folder FROM projects").fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for row in rows:
+        folder = str(row["folder"] or "") or str(row["project_id"])
+        if folder.casefold() == house.casefold():
+            return str(row["project_id"]), stage
+    return None
 
 
 def project_dir(root: Path | str, folder: str) -> Path:
@@ -61,15 +113,31 @@ def stage_dir(root: Path | str, folder: str, stage: str) -> Path:
 
 
 def inbox_dir(root: Path | str, folder: str, stage: str) -> Path:
-    return stage_dir(root, folder, stage) / INBOX_FOLDER
+    return stage_dir(root, folder, stage) / names().inbox
 
 
 def outbox_dir(root: Path | str, folder: str, stage: str) -> Path:
-    return stage_dir(root, folder, stage) / OUTBOX_FOLDER
+    return stage_dir(root, folder, stage) / names().outbox
 
 
 def pool_dir(root: Path | str, folder: str, stage: str) -> Path:
-    return stage_dir(root, folder, stage) / POOL_FOLDER
+    return stage_dir(root, folder, stage) / names().current
+
+
+def admin_dir(root: Path | str) -> Path:
+    return Path(root) / names().admin
+
+
+def template_dir(root: Path | str) -> Path:
+    return admin_dir(root) / names().templates
+
+
+def health_check_dir(root: Path | str) -> Path:
+    return admin_dir(root) / names().health_checks
+
+
+def draft_dir(root: Path | str) -> Path:
+    return Path(root) / names().drafts
 
 
 # CAD autosaves, Office lock files, system junk: not counted as files in the current folder

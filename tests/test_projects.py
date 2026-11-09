@@ -19,7 +19,7 @@ class ProjectCommandTests(unittest.TestCase):
         self.ledger_path = self.root / "ledger.db"
         self.outbound = OutboundGate(self.root, self.ledger_path)
         # A fresh ledger has no projects; one with an official ID is registered for the collision tests
-        self.outbound.ledger.register_project("PRJ-2601", "Lakeshore Park", "lakeshore")
+        self.outbound.ledger.register_project("PRJ-2603", "Lakeshore Park", "lakeshore")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -64,7 +64,7 @@ class ProjectCommandTests(unittest.TestCase):
             cli.cmd_project_create(self.payload(project_name="Some Other Project", folder="riverside"))
         with self.assertRaises(ValueError):  # ID clashes with a registered project (case does not count)
             cli.cmd_project_create(
-                self.payload(project_name="Yet Another Project", folder="yet-another-room", project_id="prj-2601")
+                self.payload(project_name="Yet Another Project", folder="yet-another-room", project_id="prj-2603")
             )
 
     def test_bind_moves_projects_issues_and_intakes(self):
@@ -170,7 +170,7 @@ class ProjectCommandTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             cli.cmd_project_bind(
-                self.payload(old_project_id=data["project_id"], new_project_id="PRJ-2601")
+                self.payload(old_project_id=data["project_id"], new_project_id="PRJ-2603")
             )
 
     def test_stages_are_registered_and_ordered(self):

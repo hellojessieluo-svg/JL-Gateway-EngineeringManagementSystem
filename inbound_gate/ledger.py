@@ -6,25 +6,26 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from common import ledger_schema, vocab
+
 from .models import STATUS_ARCHIVED, STATUS_WITHDRAWN
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = ledger_schema.SCHEMA_VERSION_INBOUND
+
+
+def _filed() -> str:
+    return vocab.word("status", STATUS_ARCHIVED)
 
 
 class IntakeLedger:
-    """Intake ledger: registration, de-duplication and receipts log for incoming items."""
+    """Intake ledger: logging, de-duplicating and recording incoming items."""
 
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
 
     def connect(self) -> sqlite3.Connection:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        return connection
+        return ledger_schema.connect(self.database_path)
 
     @contextmanager
     def session(self) -> Iterator[sqlite3.Connection]:
@@ -52,105 +53,14 @@ class IntakeLedger:
             connection.close()
 
     def initialize(self) -> None:
-        with self.session() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
+        """Create the ledger if the file does not exist; otherwise only check its tables.
 
-                CREATE TABLE IF NOT EXISTS intakes (
-                    intake_id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    archived INTEGER NOT NULL DEFAULT 0,
-                    project_id TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
-                    project_name TEXT NOT NULL DEFAULT '',
-                    source_org TEXT NOT NULL,
-                    source_person TEXT NOT NULL DEFAULT '',
-                    source_channel TEXT NOT NULL DEFAULT '',
-                    received_date TEXT NOT NULL,
-                    subject TEXT NOT NULL DEFAULT '',
-                    archive_dir TEXT NOT NULL,
-                    content_signature TEXT NOT NULL,
-                    file_count INTEGER NOT NULL,
-                    total_size INTEGER NOT NULL,
-                    todo INTEGER NOT NULL DEFAULT 0,
-                    handled_at TEXT NOT NULL DEFAULT '',
-                    notes TEXT NOT NULL DEFAULT '',
-                    manifest_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'filed',
-                    stage TEXT NOT NULL DEFAULT '',
-                    replies_to TEXT NOT NULL DEFAULT '',
-                    UNIQUE(archive_dir)
-                );
+        An existing ledger is never altered (2026-11-09): the column backfills and drops left
+        over from the 2026-09-03 clean-up that used to run here are gone.
+        """
+        ledger_schema.prepare(self.database_path)
 
-                CREATE INDEX IF NOT EXISTS ix_intakes_project
-                    ON intakes(project_id, received_date DESC);
-                CREATE INDEX IF NOT EXISTS ix_intakes_content
-                    ON intakes(content_signature);
-
-                CREATE TABLE IF NOT EXISTS intake_files (
-                    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    intake_id TEXT NOT NULL REFERENCES intakes(intake_id),
-                    source_path TEXT NOT NULL,
-                    original_name TEXT NOT NULL,
-                    archived_name TEXT NOT NULL,
-                    extension TEXT NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    checks_json TEXT NOT NULL,
-                    warnings_json TEXT NOT NULL DEFAULT '[]',
-                    UNIQUE(intake_id, archived_name)
-                );
-
-                CREATE INDEX IF NOT EXISTS ix_intake_files_hash
-                    ON intake_files(source_hash);
-
-                CREATE TABLE IF NOT EXISTS receipts (
-                    receipt_id TEXT PRIMARY KEY,
-                    intake_id TEXT NOT NULL REFERENCES intakes(intake_id),
-                    recorded_at TEXT NOT NULL,
-                    source_org TEXT NOT NULL DEFAULT '',
-                    source_channel TEXT NOT NULL DEFAULT '',
-                    received_date TEXT NOT NULL DEFAULT '',
-                    notes TEXT NOT NULL DEFAULT '',
-                    action TEXT NOT NULL
-                );
-                """
-            )
-            # 2026-09-03 cleanup: add later columns to old ledgers, drop columns left by removed features.
-            # This block can go once every old ledger has been opened once.
-            intake_columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(intakes)")
-            }
-            for column, ddl in (
-                ("stage", "TEXT NOT NULL DEFAULT ''"),
-                ("replies_to", "TEXT NOT NULL DEFAULT ''"),
-                ("source_person", "TEXT NOT NULL DEFAULT ''"),
-                ("archived", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if column not in intake_columns:
-                    connection.execute(f"ALTER TABLE intakes ADD COLUMN {column} {ddl}")
-            if "category" in intake_columns:
-                # Categories removed 2026-09-03. The old index sits on the column being dropped;
-                # DROP COLUMN fails unless the index goes first
-                connection.execute("DROP INDEX IF EXISTS ix_intakes_project")
-                connection.execute("ALTER TABLE intakes DROP COLUMN category")
-                connection.execute(
-                    "CREATE INDEX IF NOT EXISTS ix_intakes_project"
-                    " ON intakes(project_id, received_date DESC)"
-                )
-            if "task_id" in intake_columns:
-                # Task gate removed 2026-08-15
-                connection.execute("ALTER TABLE intakes DROP COLUMN task_id")
-            connection.execute(
-                "INSERT OR REPLACE INTO metadata(key, value)"
-                " VALUES('schema_version_inbound', ?)",
-                (str(SCHEMA_VERSION),),
-            )
-
-    # ------------------------------------------------------------------ de-duplication
+    # ------------------------------------------------------------------ duplicates
 
     def find_same_intake(self, project_id: str, content_signature: str) -> sqlite3.Row | None:
         self.initialize()
@@ -162,12 +72,12 @@ class IntakeLedger:
                   AND content_signature = ? AND status = ?
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (project_id, content_signature, STATUS_ARCHIVED),
+                (project_id, content_signature, _filed()),
             ).fetchone()
 
 
     def find_file_hash(self, source_hash: str) -> list[sqlite3.Row]:
-        """Look up files with the same hash among intakes, to warn "this was received before"."""
+        """Look for a file with the same hash among intakes, to say "you received this before"."""
         self.initialize()
         with self.session() as connection:
             return connection.execute(
@@ -180,7 +90,7 @@ class IntakeLedger:
                 WHERE f.source_hash = ? AND i.status = ?
                 ORDER BY happened_on DESC
                 """,
-                (source_hash, STATUS_ARCHIVED),
+                (source_hash, _filed()),
             ).fetchall()
 
     # ---------------------------------------------------------------- dropdown suggestions
@@ -211,7 +121,7 @@ class IntakeLedger:
             ).fetchall()
             return [str(row["source_person"]) for row in rows]
 
-    # ------------------------------------------------------------------ listing
+    # ------------------------------------------------------------------ lists
 
     def list_intakes(self, limit: int = 200) -> list[sqlite3.Row]:
         self.initialize()
@@ -220,13 +130,13 @@ class IntakeLedger:
                 """
                 SELECT i.*,
                        (SELECT COUNT(*) FROM receipts r
-                        WHERE r.intake_id = i.intake_id AND r.action != 'withdrawn')
+                        WHERE r.intake_id = i.intake_id AND r.action != ?)
                            AS receipt_count
                 FROM intakes i
                 ORDER BY i.received_date DESC, i.created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (vocab.word("action", "withdrawn"), limit),
             ).fetchall()
 
 
@@ -235,7 +145,7 @@ class IntakeLedger:
         with self.session() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM intakes WHERE todo = 1 AND status = ?",
-                (STATUS_ARCHIVED,),
+                (_filed(),),
             ).fetchone()
             return int(row["count"])
 
@@ -255,7 +165,7 @@ class IntakeLedger:
                 (intake_id,),
             ).fetchall()
 
-    # ------------------------------------------------------------------ status updates
+    # ------------------------------------------------------------------ state changes
 
     def add_receipt(
         self,
@@ -281,10 +191,10 @@ class IntakeLedger:
                     intake_id,
                     recorded_at,
                     source_org,
-                    source_channel,
+                    vocab.word("source_channel", source_channel),
                     received_date,
                     notes,
-                    action,
+                    vocab.word("action", action),
                 ),
             )
 
@@ -306,27 +216,29 @@ class IntakeLedger:
                 UPDATE intakes SET status = ?, archive_dir = ?
                 WHERE intake_id = ? AND status = ?
                 """,
-                (STATUS_WITHDRAWN, archive_dir, intake_id, STATUS_ARCHIVED),
+                (vocab.word("status", STATUS_WITHDRAWN), archive_dir, intake_id, _filed()),
             )
             if cursor.rowcount != 1:
-                raise ValueError("The record does not exist or has already been withdrawn.")
+                raise ValueError("That record does not exist or has already been withdrawn.")
             connection.execute(
                 """
                 INSERT INTO receipts(
                     receipt_id, intake_id, recorded_at, source_org,
                     source_channel, received_date, notes, action
-                ) VALUES (lower(hex(randomblob(16))), ?, ?, '', '', '', '', 'withdrawn')
+                ) VALUES (lower(hex(randomblob(16))), ?, ?, '', '', '', '', ?)
                 """,
-                (intake_id, withdrawn_at),
+                (intake_id, withdrawn_at, vocab.word("action", "withdrawn")),
             )
 
     def restage_intake(self, intake_id: str, stage: str, archive_dir: str) -> None:
-        """The wrong stage was picked at registration: change which stage this intake belongs to, together with its new address.
+        """The wrong stage was picked at logging: change which stage this intake belongs to,
+        together with its new address.
 
-        The stage is part of the address (room\\stage\\inbox\\), so these two columns only
-        change together -- changing stage alone would point the ledger at a place that does
-        not exist. The caller moves the files first; this only touches the ledger.
-        Only "filed" records qualify: withdrawn files sit in "_withdrawn", a different location.
+        The stage is part of the address (room\\stage\\inbox\\), so these two columns can only
+        change together -- changing stage alone would leave the ledger pointing at a place that
+        does not exist. The caller moves the files first; this only touches the ledger.
+        Only "filed" records qualify: withdrawn files live in the withdrawn folder, which has
+        its own rules.
         """
         with self.immediate_transaction() as connection:
             cursor = connection.execute(
@@ -334,22 +246,23 @@ class IntakeLedger:
                 UPDATE intakes SET stage = ?, archive_dir = ?
                 WHERE intake_id = ? AND status = ?
                 """,
-                (stage, archive_dir, intake_id, STATUS_ARCHIVED),
+                (stage, archive_dir, intake_id, _filed()),
             )
             if cursor.rowcount != 1:
-                raise ValueError("The record does not exist or is not \"filed\".")
+                raise ValueError("That record does not exist, or is not \"filed\".")
 
     def change_intake_source(
         self, intake_id: str, source_org: str, archive_dir: str
     ) -> None:
-        """The source was mistyped at registration: change this intake's source, together with its new address.
+        """The source organization was mistyped at logging: change this intake's source,
+        together with its new address.
 
-        The source is part of the address (inbox\\<date-source-subject>), so these two
-        columns only change together. The receipts log entry carries the same mistyped word
-        and is fixed too; the withdrawal entry is left alone -- it records the "withdrawn"
-        action and never had a source. The caller renames the files first; this only touches
-        the ledger. Only "filed" records qualify: withdrawn files sit in "_withdrawn", a
-        different location.
+        The source is part of the address (inbox\\<date-source-subject>), so these two columns
+        can only change together. The receipt row recorded the same mistyped word and changes
+        with it; the withdraw row does not -- it records the "withdraw" action and never had a
+        source. The caller renames the files first; this only touches the ledger.
+        Only "filed" records qualify: withdrawn files live in the withdrawn folder, which has
+        its own rules.
         """
         with self.immediate_transaction() as connection:
             cursor = connection.execute(
@@ -357,23 +270,23 @@ class IntakeLedger:
                 UPDATE intakes SET source_org = ?, archive_dir = ?
                 WHERE intake_id = ? AND status = ?
                 """,
-                (source_org, archive_dir, intake_id, STATUS_ARCHIVED),
+                (source_org, archive_dir, intake_id, _filed()),
             )
             if cursor.rowcount != 1:
-                raise ValueError("The record does not exist or is not \"filed\".")
+                raise ValueError("That record does not exist, or is not \"filed\".")
             connection.execute(
                 "UPDATE receipts SET source_org = ?"
-                " WHERE intake_id = ? AND action != 'withdrawn'",
-                (source_org, intake_id),
+                " WHERE intake_id = ? AND action != ?",
+                (source_org, intake_id, vocab.word("action", "withdrawn")),
             )
 
     def delete_intake(self, intake_id: str) -> None:
-        """Erase this intake from the ledger, together with its file rows and receipts.
+        """Erase this intake from the ledger, with its file rows and receipt rows.
 
-        This is not the same as withdrawing: a withdrawal leaves a trace (the red entry stays
-        in the ledger), a deletion leaves none. A record registered with a typo should never
-        have been in the ledger; keeping it is just noise. The caller moves the files into
-        "_withdrawn" first; this only touches the database.
+        Not the same as withdrawing: withdrawing leaves a trace (the red entry stays in the
+        ledger), deleting does not. A row with a typo from logging never belonged in the
+        ledger; keeping it is just noise. The caller first moves the files into the withdrawn
+        folder; this only touches the database.
         """
         with self.immediate_transaction() as connection:
             connection.execute("DELETE FROM receipts WHERE intake_id = ?", (intake_id,))
@@ -407,7 +320,7 @@ class IntakeLedger:
         headers = [
             "Type",
             "Record ID",
-            "Registered at",
+            "Logged at",
             "Archive",
             "Project ID",
             "Project name",
@@ -420,10 +333,10 @@ class IntakeLedger:
             "Total size",
             "To do",
             "Status",
-            "Batch folder",
+            "Archive folder",
             "Notes",
-            "Original file paths",
-            "Filed file names",
+            "Original file path",
+            "Archived file name",
             "File SHA256",
         ]
         try:

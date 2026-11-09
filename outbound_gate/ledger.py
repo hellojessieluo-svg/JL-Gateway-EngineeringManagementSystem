@@ -8,141 +8,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from common.constants import STAGES, STAGE_SEPARATOR
+from common import ledger_schema, vocab
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = ledger_schema.SCHEMA_VERSION_OUTBOUND
 
-# Stable temporary IDs for projects that have no official ID yet: TMP-001, TMP-002...
-# ASCII prefix since 2026-08-30: the ID ends up in file names, command lines and folder
-# names, and non-ASCII characters need coaxing everywhere there (code pages, escaping,
-# sorting). Old IDs in the ledger are changed over with project-bind.
+# A stable temporary ID for projects that have no official ID yet: TMP-001 and counting up.
+# Changed to an ASCII prefix on 2026-08-30: IDs end up in file names, command lines and folder
+# names, and non-ASCII characters need coaxing in all of those places (code pages, escaping,
+# sorting).
 PROVISIONAL_PREFIX = "TMP-"
 
 
 def provisional_number(project_id: str) -> int | None:
     """The sequence number inside a temporary ID; None if it is not a temporary ID."""
     text = str(project_id)
-    for prefix in (PROVISIONAL_PREFIX,):
-        if text.startswith(prefix):
-            suffix = text[len(prefix):]
-            if suffix.isdigit():
-                return int(suffix)
+    if text.startswith(PROVISIONAL_PREFIX):
+        suffix = text[len(PROVISIONAL_PREFIX):]
+        if suffix.isdigit():
+            return int(suffix)
     return None
 
 
-# Issue ledger (2026-09-03 cleanup). One row = one file, one stage, issued once on one day;
-# the files sent with one click share a batch_id. No version numbers, no packaging, no categories.
-#   file_name / file_stem / file_path / file_hash: the issued file itself (its name is its own)
-#   output_dir: the batch folder; selfcheck_path: the one change-notes file shared by the batch
-#   intake_id: the first intake replied to; all of them are linked in issue_intakes
-#   role: this file's role (2026-09-22) -- "sent" actually went to the recipient, "kept" is only
-#         stored with the batch and was not sent. Old rows are all backfilled as "sent". It is
-#         only a word in the ledger and does not change location: both kinds sit in the same batch folder.
-ISSUES_BODY = """(
-    issue_id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    project_id TEXT NOT NULL COLLATE NOCASE,
-    project_name TEXT NOT NULL DEFAULT '',
-    stage TEXT NOT NULL,
-    issue_date TEXT NOT NULL,
-    batch_id TEXT NOT NULL DEFAULT '',
-    file_name TEXT NOT NULL,
-    file_stem TEXT NOT NULL,
-    file_path TEXT NOT NULL,
-    file_hash TEXT NOT NULL,
-    output_dir TEXT NOT NULL,
-    selfcheck_path TEXT NOT NULL DEFAULT '',
-    intake_id TEXT NOT NULL DEFAULT '',
-    archived INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'issued',
-    manifest_json TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'sent'
-)"""
-
-# Before 2026-08-15 one issue was a zip package, with one row per source file inside it; since
-# then one ledger row is one file, and this holds that file's source path and check results.
-ISSUE_FILES_BODY = """(
-    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    issue_id TEXT NOT NULL REFERENCES issues(issue_id),
-    source_path TEXT NOT NULL,
-    original_name TEXT NOT NULL,
-    file_name TEXT NOT NULL,
-    extension TEXT NOT NULL,
-    file_size INTEGER NOT NULL,
-    source_hash TEXT NOT NULL,
-    checks_json TEXT NOT NULL,
-    UNIQUE(issue_id, file_name)
-)"""
-
-SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-    project_id TEXT PRIMARY KEY COLLATE NOCASE,
-    project_name TEXT NOT NULL DEFAULT '',
-    folder TEXT NOT NULL DEFAULT '',
-    stages TEXT NOT NULL DEFAULT '',
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS issues {ISSUES_BODY};
-CREATE INDEX IF NOT EXISTS ix_issues_file
-    ON issues(project_id, file_stem, stage, file_hash);
-CREATE INDEX IF NOT EXISTS ix_issues_batch ON issues(batch_id);
-
-CREATE TABLE IF NOT EXISTS issue_files {ISSUE_FILES_BODY};
-CREATE INDEX IF NOT EXISTS ix_issue_files_hash ON issue_files(source_hash);
-
-CREATE TABLE IF NOT EXISTS deliveries (
-    delivery_id TEXT PRIMARY KEY,
-    issue_id TEXT NOT NULL REFERENCES issues(issue_id),
-    recorded_at TEXT NOT NULL,
-    purpose TEXT NOT NULL,
-    channels_json TEXT NOT NULL,
-    recipients TEXT NOT NULL DEFAULT '',
-    subject TEXT NOT NULL DEFAULT '',
-    notes TEXT NOT NULL DEFAULT '',
-    action TEXT NOT NULL
-);
-
--- 2026-08-20: several intakes can be replied to; many-to-many goes through this link table. issues.intake_id keeps the first one.
-CREATE TABLE IF NOT EXISTS issue_intakes (
-    issue_id TEXT NOT NULL REFERENCES issues(issue_id),
-    intake_id TEXT NOT NULL,
-    UNIQUE(issue_id, intake_id)
-);
-CREATE INDEX IF NOT EXISTS ix_issue_intakes_intake ON issue_intakes(intake_id);
-"""
-
-# Column names on issues before the cleanup -> their names now. version, after_commit_id,
-# task_id and content_signature, left over from the version gate / task gate / packaging eras,
-# have no counterpart any more and are dropped.
-LEGACY_ISSUE_COLUMNS = {
-    "package_name": "file_name",
-    "section": "file_stem",
-    "package_path": "file_path",
-    "package_hash": "file_hash",
-}
-LEGACY_TABLES = ("pools", "commits", "commit_files", "commit_basis", "tasks")
-
-
 class Ledger:
+    """The issue side of the ledger, and the project list (both gates read the projects)."""
+
     def __init__(self, database_path: Path | str):
         self.database_path = Path(database_path)
 
     def connect(self) -> sqlite3.Connection:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        return connection
+        return ledger_schema.connect(self.database_path)
 
     @contextmanager
     def session(self) -> Iterator[sqlite3.Connection]:
@@ -169,171 +64,20 @@ class Ledger:
         finally:
             connection.close()
 
-    # ------------------------------------------------------------ create / upgrade
+    # ------------------------------------------------------------ open
 
     def initialize(self) -> None:
-        self._rebuild_legacy()
-        with self.session() as connection:
-            connection.executescript(SCHEMA)
-            # 2026-09-11: the outbox folder name gained the subject; like the recipient it is
-            # recorded on the delivery log. The CREATE statements are IF NOT EXISTS, so existing
-            # old ledgers can only get the column added (old rows have an empty subject).
-            if "subject" not in self._columns(connection, "deliveries"):
-                connection.execute(
-                    "ALTER TABLE deliveries ADD COLUMN subject TEXT NOT NULL DEFAULT ''"
-                )
-            # 2026-09-22: every issued file gained a role (sent / kept). Old rows are all
-            # backfilled as "sent" -- everything issued before then really was sent; kept files
-            # did not exist as a concept yet.
-            if "role" not in self._columns(connection, "issues"):
-                connection.execute(
-                    "ALTER TABLE issues ADD COLUMN role TEXT NOT NULL DEFAULT 'sent'"
-                )
-            connection.execute(
-                "INSERT OR REPLACE INTO metadata(key, value)"
-                " VALUES('schema_version_outbound', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+        """Create the ledger if the file does not exist; otherwise only check its tables.
 
-    @staticmethod
-    def _columns(connection: sqlite3.Connection, table: str) -> list[str]:
-        return [row["name"] for row in connection.execute(f"PRAGMA table_info({table})")]
-
-    def _rebuild_legacy(self) -> None:
-        """2026-09-03, one-off: rebuild a ledger left by three earlier redesigns into the clean shape.
-
-        An old ledger is recognized by issues still having a package_path column. Before
-        touching anything, a <name>-backup.db copy is made with the backup API; the whole
-        rebuild runs in one transaction and rolls back if foreign keys do not line up.
-        Once every old ledger has been opened once, this function can go.
+        An existing ledger is never altered (2026-11-09): the column backfills and the one-off
+        rebuild of pre-2026-09-03 ledgers that used to run here on first open are gone.
         """
-        probe = self.connect()
-        try:
-            tables = {
-                row["name"]
-                for row in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
-            old_columns = self._columns(probe, "issues") if "issues" in tables else []
-        finally:
-            probe.close()
-        if "package_path" not in old_columns:
-            return
-
-        backup = self.database_path.with_name(
-            self.database_path.stem + "-backup" + self.database_path.suffix
-        )
-        # Under WAL, copying the .db directly misses commits, so the backup API is required;
-        # connections must be closed explicitly, or on Windows the backup file stays locked
-        src, dst = sqlite3.connect(str(self.database_path)), sqlite3.connect(str(backup))
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-            src.close()
-
-        connection = self.connect()
-        try:
-            connection.execute("PRAGMA foreign_keys = OFF")
-            connection.execute("BEGIN IMMEDIATE")
-
-            # issues: copy by column name, old names mapped to new, missing columns get defaults
-            connection.execute(f"CREATE TABLE issues_new {ISSUES_BODY}")
-            targets = self._columns(connection, "issues_new")
-            rename = {new: old for old, new in LEGACY_ISSUE_COLUMNS.items()}
-            picks = []
-            for column in targets:
-                source = rename.get(column, column)
-                if source in old_columns:
-                    picks.append(source)
-                else:
-                    picks.append(
-                        "0" if column == "archived" else "'sent'" if column == "role" else "''"
-                    )
-            connection.execute(
-                f"INSERT INTO issues_new({', '.join(targets)})"
-                f" SELECT {', '.join(picks)} FROM issues"
-            )
-            for index in ("ix_issues_chain", "ix_issues_content", "ix_issues_batch"):
-                connection.execute(f"DROP INDEX IF EXISTS {index}")
-            connection.execute("DROP TABLE issues")
-            connection.execute("ALTER TABLE issues_new RENAME TO issues")
-
-            # issue_files: drop the two category columns; generated_name is file_name
-            if "issue_files" in tables:
-                connection.execute(f"CREATE TABLE issue_files_new {ISSUE_FILES_BODY}")
-                connection.execute(
-                    "INSERT INTO issue_files_new(file_id, issue_id, source_path, original_name,"
-                    " file_name, extension, file_size, source_hash, checks_json)"
-                    " SELECT file_id, issue_id, source_path, original_name, generated_name,"
-                    " extension, file_size, source_hash, checks_json FROM issue_files"
-                )
-                connection.execute("DROP INDEX IF EXISTS ix_issue_files_generated_name")
-                connection.execute("DROP INDEX IF EXISTS ix_issue_files_hash")
-                connection.execute("DROP TABLE issue_files")
-                connection.execute("ALTER TABLE issue_files_new RENAME TO issue_files")
-
-            for table in LEGACY_TABLES:
-                connection.execute(f"DROP TABLE IF EXISTS {table}")
-            if "metadata" in tables:
-                connection.execute(
-                    "DELETE FROM metadata WHERE key IN"
-                    " ('schema_version_task', 'schema_version_version')"
-                )
-            # Add missing columns to projects (ledgers old enough to lack folder/stages)
-            if "projects" in tables:
-                project_columns = self._columns(connection, "projects")
-                for column, ddl in (
-                    ("active", "INTEGER NOT NULL DEFAULT 1"),
-                    ("folder", "TEXT NOT NULL DEFAULT ''"),
-                    ("stages", "TEXT NOT NULL DEFAULT ''"),
-                ):
-                    if column not in project_columns:
-                        connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {ddl}")
-                        if column == "stages":
-                            self._seed_stages_from_ledger(connection)
-
-            broken = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if broken:
-                raise RuntimeError(
-                    "Foreign keys do not line up after rebuilding the issue ledger;"
-                    " rolled back, the ledger was not changed."
-                )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.close()
-
-    @staticmethod
-    def _seed_stages_from_ledger(connection: sqlite3.Connection) -> None:
-        """When the stages column is new, infer its initial value from stages already used in the ledger."""
-        used: dict[str, set[str]] = {}
-        for table in ("intakes", "issues"):
-            try:
-                rows = connection.execute(
-                    f"SELECT DISTINCT project_id, stage FROM {table}"
-                    " WHERE project_id <> '' AND stage <> ''"
-                )
-            except sqlite3.OperationalError:
-                continue
-            for row in rows:
-                used.setdefault(str(row["project_id"]), set()).add(str(row["stage"]))
-        if not used:
-            return
-        connection.executemany(
-            "UPDATE projects SET stages = ? WHERE project_id = ? COLLATE NOCASE",
-            [
-                (STAGE_SEPARATOR.join(s for s in STAGES if s in stages), project_id)
-                for project_id, stages in used.items()
-            ],
-        )
+        ledger_schema.prepare(self.database_path)
 
     # ------------------------------------------------------------ read
 
     def folder_of(self, project_id: str) -> str:
-        """The project room's folder name; falls back to the ID if not registered (see places.folder_in_connection)."""
+        """A project room's folder name; falls back to the ID if not registered (see places.folder_in_connection)."""
         from common.places import folder_in_connection
 
         with self.session() as connection:
@@ -342,23 +86,23 @@ class Ledger:
     def find_same_content(
         self, project_id: str, file_stem: str, stage: str, file_hash: str
     ) -> sqlite3.Row | None:
-        """Has this file, at this stage, with identical content, been issued before?
+        """Has exactly this content of this file, at this stage, been issued before?
 
-        If so, do not create another row; just record "sent again" under the original one.
+        If so, don't create another ledger row; just record "sent again" under the old one.
         """
         with self.session() as connection:
             return connection.execute(
                 """
                 SELECT * FROM issues
                 WHERE project_id = ? COLLATE NOCASE AND file_stem = ? AND stage = ?
-                  AND file_hash = ? AND status = 'issued'
+                  AND file_hash = ? AND status = ?
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (project_id, file_stem, stage, file_hash),
+                (project_id, file_stem, stage, file_hash, vocab.word("status", "issued")),
             ).fetchone()
 
     def list_batch(self, batch_id: str) -> list[sqlite3.Row]:
-        """The rows issued with one click. "Withdraw last" withdraws the whole batch."""
+        """The ledger rows sent with one click. "Withdraw last issue" withdraws the whole batch."""
         if not batch_id:
             return []
         with self.session() as connection:
@@ -368,7 +112,8 @@ class Ledger:
             ).fetchall()
 
     def get_intake(self, intake_id: str) -> sqlite3.Row | None:
-        """The intake ledger is written by the intake gate; the issue gate only takes a look: is the linked intake still there, does it belong to this project."""
+        """The intake rows belong to the intake gate; the issue gate only takes a look: is the
+        linked one still there, and does it belong to this project."""
         if not intake_id:
             return None
         with self.session() as connection:
@@ -416,22 +161,23 @@ class Ledger:
             return [str(row["recipients"]) for row in rows]
 
     def list_recent_issues(self, limit: int = 100) -> list[sqlite3.Row]:
+        withdrawn = vocab.word("action", "withdrawn")
         with self.session() as connection:
             return connection.execute(
                 """
                 SELECT i.*,
                        (SELECT COUNT(*) FROM deliveries d
-                        WHERE d.issue_id = i.issue_id AND d.action != 'withdrawn')
+                        WHERE d.issue_id = i.issue_id AND d.action != ?)
                            AS delivery_count,
                        (SELECT d.recipients FROM deliveries d
-                        WHERE d.issue_id = i.issue_id AND d.action != 'withdrawn'
+                        WHERE d.issue_id = i.issue_id AND d.action != ?
                         ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)
                            AS latest_recipients
                 FROM issues i
                 ORDER BY i.created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (withdrawn, withdrawn, limit),
             ).fetchall()
 
     # ------------------------------------------------------------ write
@@ -447,25 +193,27 @@ class Ledger:
         subject: str,
         notes: str,
         action: str,
+        auto: bool = False,
     ) -> None:
         with self.session() as connection:
             connection.execute(
                 """
                 INSERT INTO deliveries(
                     delivery_id, issue_id, recorded_at, purpose,
-                    channels_json, recipients, subject, notes, action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    channels_json, recipients, subject, notes, action, auto
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     delivery_id,
                     issue_id,
                     recorded_at,
-                    purpose,
-                    json.dumps(channels, ensure_ascii=False),
+                    vocab.word("purpose", purpose),
+                    vocab.channels_json(channels),
                     recipients,
                     subject,
                     notes,
-                    action,
+                    vocab.word("action", action),
+                    1 if auto else 0,
                 ),
             )
 
@@ -476,28 +224,39 @@ class Ledger:
             cursor = connection.execute(
                 """
                 UPDATE issues
-                SET status = 'withdrawn', output_dir = ?, file_path = ?
-                WHERE issue_id = ? AND status = 'issued'
+                SET status = ?, output_dir = ?, file_path = ?
+                WHERE issue_id = ? AND status = ?
                 """,
-                (output_dir, file_path, issue_id),
+                (
+                    vocab.word("status", "withdrawn"),
+                    output_dir,
+                    file_path,
+                    issue_id,
+                    vocab.word("status", "issued"),
+                ),
             )
             if cursor.rowcount != 1:
-                raise ValueError("The record does not exist or has already been withdrawn.")
+                raise ValueError("That record does not exist or has already been withdrawn.")
             connection.execute(
                 """
                 INSERT INTO deliveries(
                     delivery_id, issue_id, recorded_at, purpose,
                     channels_json, recipients, subject, notes, action
-                ) VALUES (lower(hex(randomblob(16))), ?, ?, 'issue', '[]', '', '', '', 'withdrawn')
+                ) VALUES (lower(hex(randomblob(16))), ?, ?, ?, '[]', '', '', '', ?)
                 """,
-                (issue_id, withdrawn_at),
+                (
+                    issue_id,
+                    withdrawn_at,
+                    vocab.word("purpose", "issue"),
+                    vocab.word("action", "withdrawn"),
+                ),
             )
 
     def relink_issue(self, issue_ids: list[str], intake_ids: list[str]) -> int:
-        """Change which intakes an existing issue is linked to. No file moves; only the link in the ledger changes.
+        """Change which intakes existing issues are linked to. No file moves; only the link in the ledger changes.
 
-        The list given is the **whole set** after the change; `issues.intake_id` keeps the
-        first one. An empty set unlinks.
+        The list given is the **whole set** after the change; `issues.intake_id` keeps the first
+        one. Passing an empty set unlinks.
         """
         primary = intake_ids[0] if intake_ids else ""
         with self.immediate_transaction() as connection:
@@ -518,11 +277,12 @@ class Ledger:
             return len(issue_ids)
 
     def delete_issue(self, issue_id: str) -> int:
-        """Erase this issue from the ledger, with its file rows and delivery log. Returns how many intakes were unlinked.
+        """Erase this issue from the ledger, with its file rows and delivery rows. Returns how
+        many intakes were unlinked.
 
-        A withdrawal leaves a trace, a deletion leaves none -- a record registered with a typo
-        should never have been in the ledger. The caller moves the files into "_withdrawn"
-        first; this only touches the database.
+        Withdrawing leaves a trace, deleting does not -- a row with a typo from logging never
+        belonged in the ledger. The caller first moves the files into the withdrawn folder;
+        this only touches the database.
         """
         with self.immediate_transaction() as connection:
             connection.execute("DELETE FROM deliveries WHERE issue_id = ?", (issue_id,))
@@ -530,7 +290,8 @@ class Ledger:
             connection.execute("DELETE FROM issue_intakes WHERE issue_id = ?", (issue_id,))
             unlinked = 0
             try:
-                # The other end of the chain: intakes that say "I reply to this issue" get unlinked
+                # The other end of the causal chain: an intake saying "I reply to this issue"
+                # gets that link removed
                 unlinked = connection.execute(
                     "UPDATE intakes SET replies_to = '' WHERE replies_to = ?", (issue_id,)
                 ).rowcount
@@ -546,6 +307,8 @@ class Ledger:
     # ------------------------------------------------------------ projects
 
     def seed_projects(self, projects: tuple[tuple[str, str], ...]) -> None:
+        if not projects:
+            return
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.session() as connection:
             for project_id, project_name in projects:
@@ -566,7 +329,9 @@ class Ledger:
                 )
 
     def seed_project_names(self, project_names: tuple[str, ...]) -> None:
-        """Give known projects without an official ID a stable temporary ID; existing records are left alone."""
+        """Give known projects without an official ID a stable temporary ID; existing rows are left alone."""
+        if not project_names:
+            return
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.immediate_transaction() as connection:
             rows = connection.execute("SELECT project_id FROM projects").fetchall()
@@ -613,7 +378,7 @@ class Ledger:
             )
 
     def register_project_name(self, project_name: str, folder: str = "") -> str:
-        """Register a project by name only and return the stable temporary ID the system assigns."""
+        """Register only a project name and return the stable temporary ID the system assigns."""
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.immediate_transaction() as connection:
             existing = connection.execute(
@@ -653,7 +418,7 @@ class Ledger:
             return provisional_id
 
     def bind_project_id(self, old_project_id: str, new_project_id: str) -> None:
-        """Bind a temporary ID to an official ID; existing issue records move over with it."""
+        """Bind a temporary ID to an official ID; existing issue rows move along with it."""
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.immediate_transaction() as connection:
             existing = connection.execute(
@@ -676,7 +441,8 @@ class Ledger:
                 (new_project_id, old_project_id),
             )
             try:
-                # The intake ledger has to follow too, or the intake history loses its project after binding
+                # The intake rows have to move too, or after binding the intake history would
+                # come loose from the project
                 connection.execute(
                     "UPDATE intakes SET project_id = ? WHERE project_id = ? COLLATE NOCASE",
                     (new_project_id, old_project_id),
@@ -736,8 +502,8 @@ class Ledger:
 
         headers = [
             "Issue ID", "Created at", "Project ID", "Project name", "File name", "Stage",
-            "Issue date", "Status", "File path", "File SHA256", "Recorded at", "Purpose", "Channels",
-            "Recipients", "Action", "Notes", "Original file paths", "Source file SHA256",
+            "Issue date", "Status", "File path", "File SHA256", "Recorded at", "Purpose", "Channel",
+            "Recipient", "Action", "Notes", "Original file path", "Source file SHA256",
         ]
         try:
             with temporary.open("w", encoding="utf-8-sig", newline="") as stream:

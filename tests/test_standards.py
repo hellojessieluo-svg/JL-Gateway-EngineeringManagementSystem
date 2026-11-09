@@ -5,13 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from common.config import STANDARD_CATEGORIES
-from gate_api import cli, standards
+from gate_api import cli
 from outbound_gate.core import OutboundGate
 
-
-(TECH, CLIENT, COMPANY) = (c["name"] for c in STANDARD_CATEGORIES)
-(TECH_DIR, CLIENT_DIR, COMPANY_DIR) = (c["folder"] for c in STANDARD_CATEGORIES)
+TECH, CLIENT, COMPANY = "Technical standards", "Client regulations", "Company requirements"
+# Book-title marks around the title, and the full-width slash some codes use (U+300A U+300B U+FF0F)
+L, R, SLASH = "\u300a", "\u300b", "\uff0f"
+GB = f"GB 50139-2014{L}Inland Navigation Standard{R}"
 
 
 class StandardsTests(unittest.TestCase):
@@ -22,29 +22,29 @@ class StandardsTests(unittest.TestCase):
         self.ledger_path = self.root / "ledger.db"
         OutboundGate(self.root, self.ledger_path)
         self.ref = base / "_reference"
-        self.stds = self.ref / TECH_DIR
-        orig = self.stds / standards.ORIGINALS
+        self.stds = self.ref / "standards"
+        orig = self.stds / "originals"
         orig.mkdir(parents=True)
-        (orig / "GB 50139-2014 Inland navigation standard.pdf").write_bytes(b"%PDF")
-        (orig / "GB 50139-2014 Inland navigation standard.md").write_text("# x", encoding="utf-8")
-        (orig / "GB_T 11836-2023 Concrete and reinforced concrete sewer pipes.pdf").write_bytes(b"%PDF")
-        (orig / "DG_TJ 08-2100-2012 Constructed wetland wastewater treatment.pdf").write_bytes(b"%PDF")
-        (orig / "SL_T 386-2025 Slope and retaining wall design for water projects.pdf").write_bytes(b"%PDF")
+        (orig / f"{GB}.pdf").write_bytes(b"%PDF")
+        (orig / f"{GB}.md").write_text("# x", encoding="utf-8")
+        (orig / f"GB{SLASH}T 11836-2023{L}Concrete and Reinforced Concrete Sewer Pipes{R}.pdf").write_bytes(b"%PDF")
+        (orig / f"DG{SLASH}TJ 08-2100-2012{L}Constructed Wetland Wastewater Treatment{R}.pdf").write_bytes(b"%PDF")
+        (orig / f"SL{SLASH}T 386-2025{L}Slope and Retaining Wall Design for Water Projects{R}.pdf").write_bytes(b"%PDF")
         (orig / "readme.md").write_text("notes", encoding="utf-8")
-        guides = self.stds / standards.GUIDES
+        guides = self.stds / "guides"
         guides.mkdir()
         (guides / "Termite control guide for water projects.pdf").write_bytes(b"%PDF")
-        (self.stds / standards.EXCERPTS / "excerpt_GB50139 Inland navigation standard").mkdir(parents=True)
-        (self.stds / standards.EXCERPTS / "excerpt_SL386 Slope and retaining wall design for water projects").mkdir()
-        (self.stds / standards.PENDING).mkdir()
-        (self.stds / standards.PENDING / "JTS 181-2016_Waterway engineering design code.pdf").write_bytes(b"%PDF")
+        (self.stds / "excerpts" / "excerpt_GB50139 Inland navigation standard").mkdir(parents=True)
+        (self.stds / "excerpts" / "excerpt_SL386 Slope and retaining wall design for water projects").mkdir()
+        (self.stds / "pending").mkdir()
+        (self.stds / "pending" / "JTS 181-2016_Waterway engineering design code.pdf").write_bytes(b"%PDF")
         # The other two categories are flat folders: no code, the whole file name is the title (2026-09-21)
-        methods = self.ref / CLIENT_DIR
+        methods = self.ref / "client-regulations"
         (methods / "2024").mkdir(parents=True)
         (methods / "Survey and design management rules 2024 revision notice.pdf").write_bytes(b"%PDF")
         (methods / "Notice on issuing the management rules.doc").write_bytes(b"\xd0\xcf")
         (methods / "2024" / "Acme Water Authority notice 2024-56.pdf").write_bytes(b"%PDF")
-        rules = self.ref / COMPANY_DIR
+        rules = self.ref / "company-requirements"
         rules.mkdir()
         (rules / "Drafting baseline requirements.md").write_text("# x", encoding="utf-8")
 
@@ -69,18 +69,18 @@ class StandardsTests(unittest.TestCase):
         self.assertTrue(all(c["exists"] for c in data["categories"]))
         by_code = {x["code"]: x for x in data["items"] if x["code"]}
         gb = by_code["GB 50139-2014"]
-        self.assertEqual(gb["title"], "Inland navigation standard")
+        self.assertEqual(gb["title"], "Inland Navigation Standard")
         self.assertEqual(gb["year"], "2014")
         self.assertTrue(gb["pdf"].endswith(".pdf"))
         self.assertTrue(gb["md"].endswith(".md"))
         self.assertIn("excerpt_GB50139", gb["excerpt"])
         self.assertEqual(gb["status"], "current")
-        gbt = by_code["GB_T 11836-2023"]
+        gbt = by_code[f"GB{SLASH}T 11836-2023"]
         self.assertEqual(gbt["excerpt"], "")
         self.assertEqual(gbt["md"], "")
-        # The year is the last four-digit number; the "_T" does not stop the excerpt from matching
-        self.assertEqual(by_code["DG_TJ 08-2100-2012"]["year"], "2012")
-        self.assertIn("excerpt_SL386", by_code["SL_T 386-2025"]["excerpt"])
+        # The year is the last four-digit number; the "/T" does not stop the excerpt from matching
+        self.assertEqual(by_code[f"DG{SLASH}TJ 08-2100-2012"]["year"], "2012")
+        self.assertIn("excerpt_SL386", by_code[f"SL{SLASH}T 386-2025"]["excerpt"])
         guide = next(x for x in data["items"] if x["kind"] == "guide")
         self.assertEqual(guide["title"], "Termite control guide for water projects")
         self.assertEqual(guide["code"], "")
@@ -106,7 +106,7 @@ class StandardsTests(unittest.TestCase):
 
     def test_hand_fields_overlay_disk_rows(self) -> None:
         saved = cli.cmd_standard_save(self.payload(
-            key=TECH + "::GB 50139-2014 Inland navigation standard", status="to verify",
+            key=f"{TECH}::{GB}", status="to verify",
             scope="feasibility - navigation study", notes="check the 2024 revision"
         ))
         self.assertEqual(saved["status"], "to verify")
@@ -115,7 +115,7 @@ class StandardsTests(unittest.TestCase):
         self.assertEqual((gb["status"], gb["scope"], gb["notes"]),
                          ("to verify", "feasibility - navigation study", "check the 2024 revision"))
         # Saving again edits the entry, it does not add a second one
-        cli.cmd_standard_save(self.payload(key=TECH + "::GB 50139-2014 Inland navigation standard", status="current"))
+        cli.cmd_standard_save(self.payload(key=f"{TECH}::{GB}", status="current"))
         data = cli.cmd_standards(self.payload())
         gb = next(x for x in data["items"] if x["code"] == "GB 50139-2014")
         self.assertEqual(gb["status"], "current")
@@ -123,12 +123,13 @@ class StandardsTests(unittest.TestCase):
 
     def test_save_rejects_unknown_key_and_bad_status(self) -> None:
         with self.assertRaises(ValueError):
-            cli.cmd_standard_save(self.payload(key=TECH + "::SL 252-2017 Classification of water projects", status="current"))
+            cli.cmd_standard_save(self.payload(
+                key=f"{TECH}::SL 252-2017{L}Classification of Water Projects{R}", status="current"))
         with self.assertRaises(ValueError):
             # The same stem under the wrong category is unknown too: status is keyed on "category::stem"
-            cli.cmd_standard_save(self.payload(key=COMPANY + "::GB 50139-2014 Inland navigation standard", status="current"))
+            cli.cmd_standard_save(self.payload(key=f"{COMPANY}::{GB}", status="current"))
         with self.assertRaises(ValueError):
-            cli.cmd_standard_save(self.payload(key=TECH + "::GB 50139-2014 Inland navigation standard", status="whatever"))
+            cli.cmd_standard_save(self.payload(key=f"{TECH}::{GB}", status="whatever"))
 
     def test_missing_root_is_reported_not_raised(self) -> None:
         data = cli.cmd_standards(self.payload(reference_root=str(self.ref / "missing")))

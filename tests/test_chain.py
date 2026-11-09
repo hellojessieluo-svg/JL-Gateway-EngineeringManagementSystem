@@ -11,12 +11,13 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from common.constants import SELFCHECK_FILENAME
-from common.places import DRAFT_FOLDER, INBOX_FOLDER, OUTBOX_FOLDER, WITHDRAWN_FOLDER
 from gate_api import cli
 from inbound_gate import InboundGate, IntakeItem, IntakeRequest
 from outbound_gate import IssueRequest, OutboundGate, SourceItem
 
+# Default names (tests run without a config)
+SELFCHECK_FILENAME = "change-notes.md"
+DRAFT_FOLDER, INBOX_FOLDER, OUTBOX_FOLDER, WITHDRAWN_FOLDER = "_drafts", "inbox", "outbox", "_withdrawn"
 
 PROJECT = "PRJ-2601"
 PROJECT_NAME = "Riverside Wetland Restoration"
@@ -182,10 +183,15 @@ class TwoGateChainTests(unittest.TestCase):
             {**self.payload(), "intake_ids": [second.record_id]}
         )
         self.assertEqual(len(blocked["failed"]), 1)
-        # Relinking = the whole set replaced by that one; the column and the link table move together
+        # Relinking (mode=replace) = the whole set replaced by that one; the column and the link table move together
         third = self.intake("third matter", self.make_pdf("letter-c.pdf", b"c"))
         cli.cmd_relink_issue(
-            {**self.payload(), "issue_id": issue_id, "intake_id": third.record_id}
+            {
+                **self.payload(),
+                "issue_id": issue_id,
+                "intake_id": third.record_id,
+                "mode": "replace",
+            }
         )
         with self.outbound.ledger.session() as connection:
             row = connection.execute(
@@ -206,6 +212,7 @@ class TwoGateChainTests(unittest.TestCase):
                 **self.payload(),
                 "issue_id": issue_id,
                 "intake_ids": [third.record_id, first.record_id],
+                "mode": "replace",
             }
         )
         with self.outbound.ledger.session() as connection:
@@ -221,6 +228,25 @@ class TwoGateChainTests(unittest.TestCase):
             }
         self.assertEqual(row["intake_id"], third.record_id)
         self.assertEqual(both, {third.record_id, first.record_id})
+        # The default is append (2026-11-09): give only the new one; the two already linked stay, the first stays first
+        cli.cmd_relink_issue(
+            {**self.payload(), "issue_id": issue_id, "intake_id": second.record_id}
+        )
+        with self.outbound.ledger.session() as connection:
+            row = connection.execute(
+                "SELECT intake_id FROM issues WHERE issue_id = ?", (issue_id,)
+            ).fetchone()
+            three = {
+                r["intake_id"]
+                for r in connection.execute(
+                    "SELECT intake_id FROM issue_intakes WHERE issue_id = ?",
+                    (issue_id,),
+                )
+            }
+        self.assertEqual(row["intake_id"], third.record_id)
+        self.assertEqual(three, {third.record_id, first.record_id, second.record_id})
+        with self.assertRaises(ValueError):  # appending nothing: undoing a link has to say replace
+            cli.cmd_relink_issue({**self.payload(), "issue_id": issue_id})
 
     def test_reply_links_next_intake_to_the_issue(self) -> None:
         result = self.issue(self.make_dwg("site-plan.dwg", "v1"))

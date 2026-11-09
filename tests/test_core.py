@@ -7,6 +7,7 @@ These tests guard exactly those rules.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,13 +19,15 @@ from pathlib import Path
 from unittest import mock
 
 from common.config import config_path
-from common.constants import SELFCHECK_FILENAME
+from common.ledger_schema import LedgerSchemaError
 from inbound_gate import InboundGate, IntakeItem, IntakeRequest
 from outbound_gate import IssueRequest, OutboundGate, SourceItem
 from outbound_gate.ledger import Ledger
 from common.errors import ValidationError
-from common.places import OUTBOX_FOLDER, WITHDRAWN_FOLDER
 
+# Default names (tests run without a config)
+SELFCHECK_FILENAME = "change-notes.md"
+OUTBOX_FOLDER, WITHDRAWN_FOLDER = "outbox", "_withdrawn"
 
 PROJECT = "PRJ-2601"
 PROJECT_NAME = "Riverside Wetland Restoration"
@@ -195,8 +198,9 @@ class OutboundGateCoreTests(unittest.TestCase):
         for dead_table in ("pools", "commits", "commit_files", "commit_basis", "tasks"):
             self.assertNotIn(dead_table, tables)
 
-    def test_legacy_ledger_is_rebuilt_on_first_open(self) -> None:
-        """An old ledger (package_* columns, category columns, task table) is rebuilt clean on first open, data moved across."""
+    def test_legacy_ledger_is_refused_and_left_alone(self) -> None:
+        """An old ledger (package_* columns, category columns, task table) is no longer rebuilt on open
+        (2026-11-09): opening it is refused, and not a byte of it changes -- no backup is made either."""
         legacy = self.base / "old-ledger.db"
         connection = sqlite3.connect(legacy)
         connection.executescript(
@@ -236,12 +240,12 @@ class OutboundGateCoreTests(unittest.TestCase):
             CREATE TABLE tasks (task_id TEXT PRIMARY KEY);
             CREATE TABLE commits (commit_id TEXT PRIMARY KEY);
             INSERT INTO issues VALUES ('i1', 't', 'PRJ-2601', 'Riverside', 'site-plan',
-                'construction-drawings', '2026-08-01', 'D:\\out', 'D:\\out\\site-plan.dwg',
+                'construction-drawings', '2026-08-01', 'X:\\out', 'X:\\out\\site-plan.dwg',
                 'site-plan.dwg', 'HASH', 'SIG', '{}', 'issued', '', 'task-1', 'b1', 'n1',
-                'D:\\out\\notes.md', 1, 2);
+                'X:\\out\\notes.md', 1, 2);
             INSERT INTO issue_files(issue_id, source_path, original_name, result_type,
                 generated_name, extension, file_size, source_hash, checks_json)
-                VALUES ('i1', 'D:\\src\\site-plan.dwg', 'site-plan.dwg', 'drawing',
+                VALUES ('i1', 'X:\\src\\site-plan.dwg', 'site-plan.dwg', 'drawing',
                         'site-plan.dwg', '.dwg', 10, 'HASH', '[]');
             INSERT INTO deliveries VALUES ('d1', 'i1', 't', 'issue', '["WeChat"]',
                 'Acme Water Authority', '', 'issued');
@@ -249,32 +253,13 @@ class OutboundGateCoreTests(unittest.TestCase):
         )
         connection.commit()
         connection.close()
+        before = hashlib.sha256(legacy.read_bytes()).hexdigest()
 
-        ledger = Ledger(legacy)
-        ledger.initialize()
-
-        row = ledger.get_issue("i1")
-        self.assertEqual(row["file_name"], "site-plan.dwg")
-        self.assertEqual(row["file_stem"], "site-plan")
-        self.assertEqual(row["file_path"], "D:\\out\\site-plan.dwg")
-        self.assertEqual(row["file_hash"], "HASH")
-        self.assertEqual(row["batch_id"], "b1")
-        self.assertEqual(row["archived"], 1)
-        self.assertEqual(ledger.get_issue_files("i1")[0]["file_name"], "site-plan.dwg")
-        self.assertEqual(ledger.delivery_count("i1"), 1)
-        with ledger.session() as connection:
-            tables = {
-                r["name"]
-                for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
-        self.assertNotIn("tasks", tables)
-        self.assertNotIn("commits", tables)
-        # A backup was made before touching anything
-        self.assertTrue((self.base / "old-ledger-backup.db").is_file())
-        # Opening again does not rebuild again (the backup is not refreshed)
-        stamp = (self.base / "old-ledger-backup.db").stat().st_mtime_ns
-        Ledger(legacy).initialize()
-        self.assertEqual((self.base / "old-ledger-backup.db").stat().st_mtime_ns, stamp)
+        for _ in range(2):
+            with self.assertRaises(LedgerSchemaError):
+                Ledger(legacy).initialize()
+        self.assertEqual(hashlib.sha256(legacy.read_bytes()).hexdigest(), before)
+        self.assertFalse((self.base / "old-ledger-backup.db").exists())
 
     # ---------------------------------------------------------------- two hard rules
 
@@ -481,30 +466,6 @@ class ConfigPathTests(unittest.TestCase):
         """Config and service state files have one home: %LOCALAPPDATA%\\Gateway\\ (no longer redirectable since the second instance was removed on 2026-09-26)."""
         with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(Path("C:/temp"))}):
             self.assertEqual(config_path(), Path("C:/temp") / "Gateway" / "config.json")
-
-    def test_config_with_a_bom_still_loads(self) -> None:
-        from common.config import AppConfig
-
-        with tempfile.TemporaryDirectory() as temp:
-            with mock.patch.dict(os.environ, {"LOCALAPPDATA": temp}):
-                config_path().parent.mkdir(parents=True)
-                config_path().write_bytes(b"\xef\xbb\xbf" + json.dumps({"library_root": "X:/lib"}).encode())
-                self.assertEqual(AppConfig.load().library_root, "X:/lib")
-
-
-class UnsortableWordTests(unittest.TestCase):
-    def test_only_whole_words_are_rejected(self) -> None:
-        from common.naming import validate_component
-        from gate_api.library_check import UNSORTABLE
-
-        for ok in ("renewal", "finalize", "copyright"):
-            self.assertEqual(validate_component(ok, "Short name"), ok)
-            self.assertIsNone(UNSORTABLE.search(ok), ok)
-        for bad in ("plan_final", "site-copy", "Latest plan"):
-            with self.assertRaises(ValidationError):
-                validate_component(bad, "Short name")
-            self.assertIsNotNone(UNSORTABLE.search(bad), bad)
-        self.assertIsNotNone(UNSORTABLE.search("site-plan-v2"))
 
 
 if __name__ == "__main__":

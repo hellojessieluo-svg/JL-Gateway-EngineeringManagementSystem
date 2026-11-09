@@ -1,18 +1,20 @@
-"""Fixed lists that both gates agree on."""
+"""Fixed lists that both gates agree on.
+
+Names that have to match a library on disk (stages, the change-notes file name, folder names)
+are not here: they live in the local config, read through common.places.
+"""
 from __future__ import annotations
 
 
-# The issue gate only accepts these formats (archives came back on 2026-08-15: a zip you
-# packed yourself is just one file). The intake gate takes anything and only uses this list
-# to decide whether to run structural checks. .md is for the change notes.
-ALLOWED_EXTENSIONS = {
+# Known formats: both gates use this only to decide whether to run structural checks, never to
+# turn anything away. Since 2026-11-09 the issue gate takes any format, like the intake gate
+# (the allow-list kept rejecting real deliverables such as png and html); anything not listed
+# is recorded with its size and hash only.
+STRUCTURE_CHECKED_EXTENSIONS = {
     ".xlsx", ".xls", ".dwg", ".docx", ".pptx", ".ppt",
     ".pdf", ".md", ".zip", ".rar", ".7z",
 }
 SELFCHECK_EXTENSION = ".md"
-# Inside a batch folder the notes always carry this name: they are the fixed cover document
-# of every batch, not a deliverable, so "file names belong to people" does not apply (2026-08-27).
-SELFCHECK_FILENAME = "change-notes.md"
 # Each file in an issue batch has a role (2026-09-22): "sent" actually went to the recipient,
 # "kept" is supporting material stored in the same batch folder but not sent (working
 # calculations and the like). It is one word in the ledger: no extra folder, no extra table;
@@ -40,14 +42,3 @@ SELFCHECK_SKELETON = """# Change & self-check notes
 ## Appendix: Q&A log
 <!-- Paste when archiving the conversation; one subsection per date if it spans several -->
 """
-
-STAGES = (
-    "proposal",
-    "feasibility",
-    "preliminary-design",
-    "construction-drawings",
-    "construction-services",
-    "other",
-)
-# A project's registered stages are stored as one string joined with this (projects.stages).
-STAGE_SEPARATOR = ","

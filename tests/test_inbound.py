@@ -9,8 +9,10 @@ from datetime import date
 from pathlib import Path
 
 from inbound_gate import InboundGate, IntakeItem, IntakeRequest
-from common.places import GENERIC_FOLDER, INBOX_FOLDER, WITHDRAWN_FOLDER
 from common.errors import ConflictError, ValidationError
+
+# Default folder names (tests run without a config)
+GENERIC_FOLDER, INBOX_FOLDER, WITHDRAWN_FOLDER = "_general", "inbox", "_withdrawn"
 
 
 def make_docx(path: Path, marker: str = "one") -> None:

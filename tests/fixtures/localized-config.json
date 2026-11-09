@@ -1,0 +1,78 @@
+{
+  "folders": {
+    "inbox": "入件",
+    "current": "现行成果",
+    "outbox": "出件",
+    "archive": "归档",
+    "tools": "工具",
+    "withdrawn": "_已撤回",
+    "general": "_通用",
+    "drafts": "TMP",
+    "admin": "_库务",
+    "templates": "模板",
+    "health_checks": "体检",
+    "reference": "_参考"
+  },
+  "files": {
+    "ledger": "工作台账.db",
+    "spec": "文件库规范.md",
+    "change_notes": "修改及自检说明.md",
+    "project_template": "项目屋AGENTS.md",
+    "stage_template": "阶段AGENTS.md",
+    "health_report_prefix": "体检报告-"
+  },
+  "stages": ["项目建议书", "可研", "初设", "施工图", "施工服务", "其他"],
+  "stage_separator": "、",
+  "fallback_stage": "其他",
+  "standard_categories": [
+    {"name": "专业规范", "folder": "规范库", "layout": "library"},
+    {"name": "甲方管理办法", "folder": "甲方管理办法", "layout": "flat"},
+    {"name": "公司要求", "folder": "公司要求", "layout": "flat"}
+  ],
+  "standard_folders": {
+    "originals": "规范原文",
+    "guides": "导则指南",
+    "pending": "待入库",
+    "excerpts": "规范摘录"
+  },
+  "excerpt_prefix": "规范摘录",
+  "discouraged_words": ["最终", "终稿", "最新版", "new", "copy"],
+  "unsortable_words": ["最终", "终稿", "最新版", "copy", "副本"],
+  "guide_sections": ["项目卡", "布局", "口径", "接活先看"],
+  "placeholders": {"short_name": "{{简称}}", "project_id": "{{编号}}", "full_name": "{{全称}}"},
+  "ignored_root_folders": ["收件转存"],
+  "backfill_marker": "【补录",
+  "ledger_words": {
+    "status": {
+      "filed": "已入库", "withdrawn": "已撤回", "issued": "已生成",
+      "current": "现行", "superseded": "已替代", "repealed": "废止", "to verify": "待核"
+    },
+    "role": {"sent": "发出", "kept": "留底"},
+    "action": {
+      "issued": "生成", "reused": "复用", "withdrawn": "撤回", "filed": "入库",
+      "received again": "再次收到"
+    },
+    "purpose": {
+      "issue": "出件", "exchange": "互提", "review": "复核", "submission": "送审",
+      "MIS upload": "MIS上传", "self-archive": "自归档", "other": "其他"
+    },
+    "channel": {
+      "WeChat": "微信", "Email": "邮件", "USB drive": "U盘", "MIS": "MIS",
+      "Paper": "纸质送出", "In person": "现场交付", "Self-archive": "自归档", "Other": "其他"
+    },
+    "source_channel": {
+      "WeChat": "微信", "Email": "邮件", "USB drive": "U盘", "MIS": "MIS",
+      "Paper scan": "纸质扫描", "In person": "现场收取", "Other": "其他"
+    }
+  },
+  "sample": {
+    "project_name": "示例湿地修复工程",
+    "folder": "示例湿地",
+    "source_org": "某水务局",
+    "recipient": "某设计院",
+    "subject": "审查意见",
+    "file_name": "平面图.dwg",
+    "guide": "# {{简称}} ({{编号}})\n## 项目卡\n{{全称}}\n## 布局\n## 口径\n## 接活先看\n",
+    "old_pool_file": "平面图-最终.dwg"
+  }
+}

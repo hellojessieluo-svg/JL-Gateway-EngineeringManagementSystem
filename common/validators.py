@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 from common.errors import ValidationError
-from common.constants import ALLOWED_EXTENSIONS
+from common.constants import STRUCTURE_CHECKED_EXTENSIONS
 
 
 OFFICE_TEMP_PREFIX = "~$"
@@ -132,6 +132,8 @@ def structural_checks(path: Path) -> list[str]:
 
 
 def validate_source_file(path: Path) -> tuple[int, str, list[str]]:
+    """Check one file before issuing. No format is turned away: only stray junk (temporary
+    files, CAD backups) and empty files are stopped."""
     if not path.exists() or not path.is_file():
         raise ValidationError(f"Source file does not exist or is not a file: {path}")
     if path.name.startswith(OFFICE_TEMP_PREFIX):
@@ -139,14 +141,17 @@ def validate_source_file(path: Path) -> tuple[int, str, list[str]]:
     suffix = path.suffix.lower()
     if suffix in FORBIDDEN_SUFFIXES:
         raise ValidationError(f"Cannot issue a CAD backup or autosave file: {path.name}")
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise ValidationError(f"Unsupported file format: {path.name}")
     size = path.stat().st_size
     if size <= 0:
         raise ValidationError(f"File size is 0: {path.name}")
 
     checks = ["File exists, is readable and not empty"]
-    checks.extend(structural_checks(path))
+    if suffix in STRUCTURE_CHECKED_EXTENSIONS:
+        checks.extend(structural_checks(path))
+    else:
+        checks.append(
+            f"No structural check for this format ({suffix or 'no extension'}); only size and hash recorded"
+        )
     return size, sha256_file(path), checks
 
 

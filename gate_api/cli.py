@@ -10,8 +10,8 @@ Arguments come from a file, not the command line, to avoid fighting shell escapi
 non-ASCII text and quotes.
 
 Only two gates remain: intake and issue. The version gate and task gate were removed on
-2026-08-15 -- work happens directly in `current\\`, and the story behind it goes into the
-issue notes. Their tables were dropped from the ledger on 2026-09-03.
+2026-08-15 -- work happens directly in the current folder, and the story behind it goes into
+the issue notes. Their tables were dropped from the ledger on 2026-09-03.
 """
 from __future__ import annotations
 
@@ -31,21 +31,18 @@ from inbound_gate.models import (
     IntakeItem,
     IntakeRequest,
 )
-from common.config import AppConfig
+from common.config import AppConfig, active
 from outbound_gate.core import OutboundGate
 from outbound_gate.ledger import Ledger, provisional_number
 from outbound_gate.models import (
     CHANNELS,
     ISSUE_ROLES,
-    SELFCHECK_FILENAME,
     DEFAULT_PURPOSE,
-    STAGES,
-    STAGE_SEPARATOR,
     IssueRequest,
     SourceItem,
 )
-from common import places
-from . import contacts, library_check, standards
+from common import places, vocab
+from . import autofile, contacts, library_check, standards
 from common.errors import ValidationError
 from common.validators import sha256_file
 from common.naming import (
@@ -61,16 +58,12 @@ from common.naming import (
 
 
 def _config(payload: dict) -> AppConfig:
-    config = AppConfig.load()
-    if payload.get("ledger_path"):
-        config.ledger_path = payload["ledger_path"]
-    if payload.get("library_root"):
-        config.library_root = payload["library_root"]
-    if payload.get("spec_path"):
-        config.spec_path = payload["spec_path"]
-    if payload.get("reference_root"):
-        config.reference_root = payload["reference_root"]
-    return config
+    return active().with_paths(
+        ledger_path=payload.get("ledger_path"),
+        library_root=payload.get("library_root"),
+        spec_path=payload.get("spec_path"),
+        reference_root=payload.get("reference_root"),
+    )
 
 
 def _ledger(payload: dict) -> Ledger:
@@ -126,8 +119,8 @@ def cmd_context(payload: dict) -> dict:
     _outbound(payload)
     ledger = _ledger(payload)
     with ledger.session() as connection:
-        # stages: which stages this project actually has (comma-separated). Empty = not
-        # registered yet, the UI lists all six.
+        # stages: which stages this project actually has (joined with the stage separator).
+        # Empty = not registered yet, the UI lists every stage.
         projects = _rows(
             connection.execute(
                 "SELECT project_id, project_name, folder, stages FROM projects"
@@ -136,19 +129,18 @@ def cmd_context(payload: dict) -> dict:
         )
         try:
             todo = connection.execute(
-                "SELECT COUNT(*) AS n FROM intakes WHERE todo = 1 AND status = 'filed'"
+                "SELECT COUNT(*) AS n FROM intakes WHERE todo = 1 AND status = ?",
+                (vocab.word("status", "filed"),),
             ).fetchone()["n"]
         except sqlite3.OperationalError:
             todo = 0
     # stages is one string in the ledger and always leaves as an array -- the shape the UI
     # gets must be the same from both commands
     for project in projects:
-        project["stages"] = [
-            x for x in str(project.get("stages") or "").split(STAGE_SEPARATOR) if x
-        ]
+        project["stages"] = places.split_stages(project.get("stages"))
     return {
         "projects": projects,
-        "stages": list(STAGES),
+        "stages": list(places.stages()),
         "source_channels": list(SOURCE_CHANNELS),
         "channels": list(CHANNELS),
         "todo_count": todo,
@@ -159,8 +151,8 @@ def cmd_context(payload: dict) -> dict:
 
 
 def cmd_places(payload: dict) -> dict:
-    """Where the three positions for this project/stage are and how much is in `current`.
-    Addresses are computed, never asked for."""
+    """Where the three positions for this project/stage are and how much is in the current
+    folder. Addresses are computed, never asked for."""
     config = _config(payload)
     project_id = payload.get("project_id", "")
     stage = payload.get("stage", "")
@@ -214,8 +206,8 @@ def cmd_project_create(payload: dict) -> dict:
         project_id = ledger.register_project_name(project_name, folder)
     house = places.project_dir(Path(config.library_root), folder)
     house.mkdir(parents=True, exist_ok=True)
-    # A new room comes with a guide: the project card is filled from
-    # _admin\templates\project-AGENTS.md, the rest is up to people (spec section 5)
+    # A new room comes with a guide: the project card is filled from the project-guide
+    # template in the admin folder, the rest is up to people (spec section 5)
     guide = library_check.seed_guide(Path(config.library_root), folder, project_id, project_name)
     return {
         "project_id": project_id,
@@ -247,7 +239,8 @@ def cmd_project_overview(payload: dict) -> dict:
         try:
             for row in connection.execute(
                 "SELECT project_id, COUNT(*) AS n FROM intakes"
-                " WHERE todo = 1 AND status = 'filed' GROUP BY project_id"
+                " WHERE todo = 1 AND status = ? GROUP BY project_id",
+                (vocab.word("status", "filed"),),
             ):
                 todo[str(row["project_id"] or "")] = int(row["n"])
         except sqlite3.OperationalError:
@@ -266,9 +259,7 @@ def cmd_project_overview(payload: dict) -> dict:
                 "house_exists": house.is_dir(),
                 "guide_path": str(guide),
                 "has_guide": guide.is_file(),
-                "stages": [
-                    x for x in str(project["stages"] or "").split(STAGE_SEPARATOR) if x
-                ],
+                "stages": places.split_stages(project["stages"]),
                 "todo_count": todo.get(str(project["project_id"]), 0),
                 # Only a project on a temporary ID can be given an official ID
                 "provisional": provisional_number(project["project_id"]) is not None,
@@ -405,13 +396,13 @@ def cmd_project_rename(payload: dict) -> dict:
 def cmd_project_stages(payload: dict) -> dict:
     """Register which stages this project actually has.
 
-    Some projects only ever have "other"; listing all six is noise. Once registered, both
-    gates' stage dropdowns list only the registered stages; a genuinely new stage is picked
-    from "Other stage..." and registered automatically.
+    Some projects only ever have one stage; listing every stage is noise. Once registered,
+    both gates' stage dropdowns list only the registered stages; a genuinely new stage is
+    picked from "Other stage..." and registered automatically.
     So this is a filter, not a gate: the list saves the eyes, it never blocks work.
 
     `stages` replaces the whole list; `add` appends (this is what both gates use when filing).
-    Always stored in STAGES order, so the UI gets it sorted.
+    Always stored in the configured stage order, so the UI gets it sorted.
     """
     project_id = str(payload.get("project_id") or "").strip()
     if not project_id:
@@ -427,20 +418,21 @@ def cmd_project_stages(payload: dict) -> dict:
         ).fetchone()
         if row is None:
             raise ValueError(f"No project with this ID: {project_id}")
-        current = {x for x in str(row["stages"] or "").split(STAGE_SEPARATOR) if x}
+        current = set(places.split_stages(row["stages"]))
         if replace is not None:
             wanted = {str(x).strip() for x in replace if str(x).strip()}
         else:
             wanted = current | set(add)
-        unknown = wanted - set(STAGES)
+        known = places.stages()
+        unknown = wanted - set(known)
         if unknown:
             raise ValueError("Unsupported stage: " + ", ".join(sorted(unknown)))
-        ordered = [x for x in STAGES if x in wanted]
+        ordered = [x for x in known if x in wanted]
         connection.execute(
             "UPDATE projects SET stages = ?, updated_at = ? WHERE project_id = ?"
             " COLLATE NOCASE",
             (
-                STAGE_SEPARATOR.join(ordered),
+                places.join_stages(ordered),
                 datetime.now().astimezone().isoformat(timespec="seconds"),
                 project_id,
             ),
@@ -465,10 +457,14 @@ def cmd_intakes(payload: dict) -> dict:
     Only "filed" by default; pass include_withdrawn for the full history including withdrawals.
     The short name comes from projects: that is the room's address, the ID is just an ID.
     """
+    _inbound(payload)  # old ledgers get intakes.auto from the intake gate's table setup
     ledger = _ledger(payload)
     project_id = payload.get("project_id", "")
-    clauses = [] if payload.get("include_withdrawn") else ["i.status = 'filed'"]
+    clauses: list[str] = []
     params: list = []
+    if not payload.get("include_withdrawn"):
+        clauses.append("i.status = ?")
+        params.append(vocab.word("status", "filed"))
     if project_id and not payload.get("all"):
         clauses.append("(i.project_id = ? COLLATE NOCASE OR i.project_id = '')")
         params.append(project_id)
@@ -481,6 +477,9 @@ def cmd_intakes(payload: dict) -> dict:
     if stage and not payload.get("all"):
         clauses.append("(i.stage = ? OR i.stage = '')")
         params.append(stage)
+    # The dashboard's "Recent auto-filed" block only wants what an agent filed (2026-11-09)
+    if payload.get("auto_only"):
+        clauses.append("i.auto = 1")
     params.append(int(payload.get("limit", 80)))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with ledger.session() as connection:
@@ -489,7 +488,7 @@ def cmd_intakes(payload: dict) -> dict:
                 "SELECT i.intake_id, i.created_at, i.archived, i.project_id, i.project_name,"
                 " COALESCE(NULLIF(p.folder, ''), i.project_id) AS folder,"
                 " i.source_org, i.source_person, i.received_date, i.subject,"
-                " i.archive_dir, i.file_count, i.todo, i.status, i.stage, i.replies_to,"
+                " i.archive_dir, i.file_count, i.todo, i.status, i.stage, i.replies_to, i.auto,"
                 # Whether it's done is judged by evidence, not the checkbox: an issue
                 # linked to it means it has been answered
                 # (multiple intakes per issue go through the issue_intakes table since 2026-08-20)
@@ -498,12 +497,12 @@ def cmd_intakes(payload: dict) -> dict:
                 # the link table keeps the link as a trace of the withdrawal, so check status here.
                 " (SELECT COUNT(*) FROM issue_intakes x JOIN issues s"
                 "    ON s.issue_id = x.issue_id"
-                "  WHERE x.intake_id = i.intake_id AND s.status <> 'withdrawn')"
+                "  WHERE x.intake_id = i.intake_id AND s.status <> ?)"
                 "   AS issue_count"
                 " FROM intakes i LEFT JOIN projects p ON p.project_id = i.project_id"
                 f" {where}"
                 " ORDER BY i.received_date DESC, i.created_at DESC LIMIT ?",
-                params,
+                [vocab.word("status", "withdrawn"), *params],
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
@@ -557,6 +556,7 @@ def cmd_intake_brief(payload: dict) -> dict:
     intake_id = str(payload.get("intake_id") or "").strip()
     if not intake_id:
         raise ValueError("Which intake? Pass intake_id.")
+    withdrawn = vocab.word("action", "withdrawn")
     with ledger.session() as connection:
         row = connection.execute(
             "SELECT i.*, COALESCE(NULLIF(p.folder, ''), i.project_id) AS folder"
@@ -578,11 +578,11 @@ def cmd_intake_brief(payload: dict) -> dict:
             reply = connection.execute(
                 "SELECT i.issue_date, i.file_name, i.batch_id, i.output_dir,"
                 " (SELECT d.recipients FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC LIMIT 1) AS recipients,"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC LIMIT 1) AS recipients,"
                 " (SELECT d.subject FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC LIMIT 1) AS subject"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC LIMIT 1) AS subject"
                 " FROM issues i WHERE i.issue_id = ?",
-                (row["replies_to"],),
+                (withdrawn, withdrawn, row["replies_to"]),
             ).fetchone()
             if reply and reply["batch_id"]:
                 names = [
@@ -596,11 +596,12 @@ def cmd_intake_brief(payload: dict) -> dict:
             elif reply:
                 reply = {**dict(reply), "files": [str(reply["file_name"])]}
 
-    folder = str(row["folder"] or "") or places.GENERIC_FOLDER
+    general = places.names().general
+    folder = str(row["folder"] or "") or general
     stage = str(row["stage"] or "")
     project = (
         f"{row['project_name']} ({row['project_id']})" if row["project_id"]
-        else f"No project ({places.GENERIC_FOLDER})"
+        else f"No project ({general})"
     )
     who = str(row["source_org"] or "(source not set)")
     if row["source_person"]:
@@ -628,13 +629,15 @@ def cmd_intake_brief(payload: dict) -> dict:
     # A room's AGENTS.md covers only the project itself; the gates' rules travel on the task
     # card, so the AI doing the work doesn't have to look for them elsewhere (2026-09-05).
     draft = _draft_path(root, row["project_id"], stage)
+    notes_name = places.files().change_notes
+    drafts = places.names().drafts
     lines += [
         "",
-        f"When done, write a \"{SELFCHECK_FILENAME}\"; it goes out with this batch."
-        f" Write it to the library's {places.DRAFT_FOLDER} folder: {draft}",
-        "(Write only this one, nowhere else; the issue page's \"Write notes\" button reads the same file."
-        f" When it goes into the batch folder the program renames it to \"{SELFCHECK_FILENAME}\","
-        f" and after the issue the program deletes the draft from {places.DRAFT_FOLDER}.)"
+        f"When done, write the change & self-check notes (\"{notes_name}\"); they go out with"
+        f" this batch. Write them to the {drafts} folder at the library root: {draft}",
+        "(Write only this one, nowhere else; the issue page's \"Write notes\" button reads the"
+        f" same file. When it goes into the batch folder the program renames it to \"{notes_name}\","
+        f" and after the issue the program deletes this draft from {drafts}.)"
         " The skeleton is below: fill it in section by section, don't change the headings:",
         "",
         library_check.selfcheck_skeleton(root).rstrip("\n"),
@@ -688,7 +691,7 @@ def cmd_intake_source(payload: dict) -> dict:
 # --------------------------------------------------- delete (rows filed by mistake)
 # Withdraw means "received, then taken back" and leaves a red line in the ledger; delete
 # means "this row should never have existed" and leaves no trace. Neither destroys files:
-# delete also moves the folder into the room's _withdrawn first, then erases the row.
+# delete also moves the folder into the room's withdrawn folder first, then erases the row.
 
 
 def _delete_many(ids, delete_one, id_field: str) -> dict:
@@ -787,7 +790,7 @@ def cmd_spec_read(payload: dict) -> dict:
 
 
 def cmd_template_save(payload: dict) -> dict:
-    """Save a template edited on the "Spec" page back to _admin\\templates\\. Only the three known names are accepted."""
+    """Save a template edited on the "Spec" page back to the admin templates folder. Only the three known names are accepted."""
     config = _config(payload)
     return library_check.write_template(
         Path(config.library_root), str(payload.get("name") or ""), payload.get("text") or "",
@@ -801,7 +804,7 @@ def cmd_library_check(payload: dict) -> dict:
 
 
 def cmd_library_check_export(payload: dict) -> dict:
-    """Run a health check and write the result as markdown into _admin\\health-checks\\, returning the path; errors_only exports only "error" findings."""
+    """Run a health check and write the result as markdown into the admin health-checks folder, returning the path; errors_only exports only "error" findings."""
     config = _config(payload)
     result = library_check.check_library(Path(config.library_root), _ledger(payload))
     return library_check.export_report(
@@ -828,7 +831,7 @@ def cmd_contact_delete(payload: dict) -> dict:
 
 
 def cmd_standards(payload: dict) -> dict:
-    """One row per standard or regulation in the three _reference categories (disk is the truth), plus the hand-filled status / applies to / notes."""
+    """One row per standard or regulation in the reference categories (disk is the truth), plus the hand-filled status / applies to / notes."""
     config = _config(payload)
     return standards.cmd_standards(Path(config.reference_root), _ledger(payload), payload)
 
@@ -866,17 +869,24 @@ def cmd_issue_create(payload: dict) -> dict:
         intake_ids=[str(x) for x in (payload.get("intake_ids") or [])],
         notes=payload.get("notes", ""),
     )
-    result = gate.create_issue(request)
+    return _after_issue(payload, request, gate.create_issue(request))
+
+
+def _after_issue(payload: dict, request: IssueRequest, result) -> dict:
+    """The steps after an issue is in the ledger: register the stage, delete the draft, close
+    the intakes. Shared by issues filed by a person and filed automatically."""
     _remember_stage(payload, request.project_id, request.stage)
-    # Once it has gone out, the draft in _drafts has done its job (2026-09-26); failing to
-    # delete it must not turn a success into a failure
+    # Once it has gone out, the draft in the drafts folder has done its job (2026-09-26);
+    # failing to delete it must not turn a success into a failure
     try:
         draft_removed = _consume_draft(
             Path(_config(payload).library_root), request.selfcheck_path, result.selfcheck_path
         )
     except OSError as exc:
         draft_removed = ""
-        result.warnings.append(f"Issue done, but the draft in {places.DRAFT_FOLDER} could not be deleted: {exc}")
+        result.warnings.append(
+            f"Issue done, but the draft in {places.names().drafts} could not be deleted: {exc}"
+        )
     # Answered means no longer to do: the intakes this issue hangs on are closed right away.
     # "Done" shouldn't be something a person clicks -- sent out means replied.
     # It lives in this layer because only this layer knows both gates (the issue gate doesn't import the intake gate).
@@ -913,6 +923,322 @@ def cmd_withdraw_issue(payload: dict) -> dict:
     return {"moved_to": str(target), "count": 1}
 
 
+# ---------------------------------------------------- agent auto-filing at the end of a job (2026-11-09)
+# A clear "this is the version / I sent it / issue it" or "log it" in the conversation is the
+# confirmation: the agent calls one of these two commands and files directly, without first
+# listing everything and waiting for a nod.
+# Two safety nets: a three-way check after filing (autofile.verify_*), and the ledger marks
+# the entry "auto" so the dashboard lists it with a one-click withdraw (through the existing
+# withdraw-issue / withdraw-intake). The ledger is not backed up automatically.
+# Anything that can't be worked out for sure (project, stage, which intake) is an error so
+# the agent asks; the program does not guess.
+
+# Source channel -> issue channel: matching ones carry over, the two counterparts are swapped,
+# everything else becomes "Other"
+AUTO_CHANNEL_MAP = {"Paper scan": "Paper", "In person": "In person"}
+
+
+def _resolve_project(connection: sqlite3.Connection, text: str) -> sqlite3.Row:
+    """An agent usually holds a short name or project name, not an ID: all three are
+    accepted, and if none matches it says so."""
+    text = str(text or "").strip()
+    rows = connection.execute(
+        "SELECT project_id, project_name, folder FROM projects WHERE active = 1"
+    ).fetchall()
+    for key in ("project_id", "folder", "project_name"):
+        hits = [r for r in rows if str(r[key] or "").casefold() == text.casefold()]
+        if len(hits) == 1:
+            return hits[0]
+    raise ValueError(
+        f"Can't tell which project this is: \"{text}\". Give the project ID, the short name"
+        " or the full project name."
+    )
+
+
+def _intake_line(row) -> str:
+    return (
+        f"{row['intake_id']}  {row['received_date']} {row['source_org'] or '(source not set)'}"
+        f"{' · ' + row['subject'] if row['subject'] else ''}"
+        f"{' (to do)' if row['todo'] else ''}"
+    )
+
+
+def _auto_pick_intake(connection: sqlite3.Connection, project_id: str, stage: str) -> str:
+    """If this project and stage has exactly one intake to do, link it; with none or more
+    than one, list the candidates for a person to choose."""
+    filed = vocab.word("status", "filed")
+    pending = connection.execute(
+        "SELECT intake_id, received_date, source_org, subject, todo FROM intakes"
+        " WHERE project_id = ? COLLATE NOCASE AND stage = ? AND status = ? AND todo = 1"
+        " ORDER BY received_date DESC, created_at DESC",
+        (project_id, stage, filed),
+    ).fetchall()
+    if len(pending) == 1:
+        return str(pending[0]["intake_id"])
+    if pending:
+        raise ValueError(
+            f"{project_id} {stage} has {len(pending)} intakes to do and it is not clear which one"
+            " this batch answers. Pass intake_id (or several in intake_ids):\n"
+            + "\n".join(_intake_line(r) for r in pending)
+        )
+    recent = connection.execute(
+        "SELECT intake_id, received_date, source_org, subject, todo FROM intakes"
+        " WHERE project_id = ? COLLATE NOCASE AND stage = ? AND status = ?"
+        " ORDER BY received_date DESC, created_at DESC LIMIT 5",
+        (project_id, stage, filed),
+    ).fetchall()
+    listed = "\n".join(_intake_line(r) for r in recent) or (
+        "(this stage has no intake at all; log the intake first)"
+    )
+    raise ValueError(
+        f"{project_id} {stage} has no intake to do, and an issue must be linked to one."
+        " The most recent ones; pass intake_id to choose:\n" + listed
+    )
+
+
+def _auto_items(payload: dict) -> list[dict]:
+    """`files` as a list of paths is simplest; `items` as {path, role/relative_name} works too."""
+    raw = payload.get("items") or payload.get("files") or []
+    items = [{"path": x} if isinstance(x, str) else dict(x) for x in raw]
+    for item in items:
+        if item.get("role"):
+            item["role"] = vocab.program_word("role", str(item["role"]).strip())
+    return items
+
+
+def cmd_issue_auto(payload: dict) -> dict:
+    """An agent issues at the end of a job: only the files and the subject are given, the
+    program fills in the rest and files directly.
+
+    Arguments: `files` (list of paths; to mark kept files use `items`: [{path, role}]),
+    `subject`, `notes`; optional `intake_id`/`intake_ids`, `project` (ID / short name /
+    project name), `stage`, `recipients`, `channels`, `issue_date` (for "sent a few days
+    ago", that day), `selfcheck_path`.
+    How the rest is filled in: project and stage are worked out from the files sitting in
+    <short name>\\<stage>\\<current folder>\\; the intake is the only one to do in that stage;
+    recipient and channel come from the linked intake's source person (or else source
+    organization) and channel; the date defaults to today; the notes default to the draft in
+    the drafts folder. The return value carries the three-way check after filing (verify);
+    if it fails, verified is false and alert says what doesn't match.
+    """
+    config = _config(payload)
+    root = Path(config.library_root)
+    gate = _outbound(payload)
+    _inbound(payload)  # picking an intake reads the intakes table
+    items = _auto_items(payload)
+    if not items:
+        raise ValueError("Which files to issue? Pass files (a list of paths).")
+
+    current = places.names().current
+    with gate.ledger.session() as connection:
+        located = {places.locate_in_pool(connection, root, x["path"]) for x in items}
+        if payload.get("project") or payload.get("project_id"):
+            project = _resolve_project(connection, payload.get("project") or payload["project_id"])
+        else:
+            if None in located or len(located) != 1:
+                raise ValueError(
+                    "Can't work out the project and stage: the files must all be under one"
+                    f" <short name>\\<stage>\\{current}\\ folder; otherwise pass project and stage."
+                )
+            project = _resolve_project(connection, next(iter(located))[0])
+        project_id = str(project["project_id"])
+        stage = str(payload.get("stage") or "").strip()
+        if not stage:
+            stages = {x[1] for x in located if x and x[0].casefold() == project_id.casefold()}
+            if len(stages) != 1 or None in located:
+                raise ValueError(
+                    f"Can't work out the stage: the files are not under the {current} folder of"
+                    " one stage of this project; pass stage."
+                )
+            stage = stages.pop()
+
+        intake_ids = [str(x) for x in (payload.get("intake_ids") or []) if str(x)]
+        if payload.get("intake_id"):
+            intake_ids.insert(0, str(payload["intake_id"]))
+        intake_ids = list(dict.fromkeys(intake_ids)) or [
+            _auto_pick_intake(connection, project_id, stage)
+        ]
+        first = connection.execute(
+            "SELECT source_org, source_person, source_channel, subject FROM intakes"
+            " WHERE intake_id = ?",
+            (intake_ids[0],),
+        ).fetchone()
+    if first is None:
+        raise ValueError(f"The intake to link is not in the ledger: {intake_ids[0]}")
+
+    recipients = str(payload.get("recipients") or "").strip() or str(
+        first["source_person"] or first["source_org"] or ""
+    )
+    # An agent may pass the ledger's own words (common.vocab); read them as program words
+    channels = [
+        vocab.program_word("channel", str(x).strip())
+        for x in (payload.get("channels") or [])
+        if str(x).strip()
+    ]
+    if not channels:
+        channel = AUTO_CHANNEL_MAP.get(str(first["source_channel"] or ""), str(first["source_channel"] or ""))
+        channels = [channel if channel in CHANNELS else "Other"]
+    today = date.today()
+    issue_date = (
+        _parse_date(str(payload["issue_date"]), "Issue date") if payload.get("issue_date") else today
+    )
+    selfcheck = Path(str(payload.get("selfcheck_path") or "") or _draft_path(root, project_id, stage))
+    if not selfcheck.is_file():
+        raise ValueError(
+            f"There are no change & self-check notes yet: write them to {selfcheck} first, then issue."
+        )
+
+    warnings: list[str] = []
+    if issue_date < today:
+        warnings.append(
+            f"The issue date is {issue_date.isoformat()} (before today): what goes into the ledger"
+            " is the current work as it is right now; if it changed after that day, the hash in"
+            " the ledger is not the version that was sent."
+        )
+    request = IssueRequest(
+        project_id=project_id,
+        project_name=str(project["project_name"] or ""),
+        stage=stage,
+        issue_date=issue_date,
+        purpose=DEFAULT_PURPOSE,
+        channels=channels,
+        archived=bool(payload.get("archived")),
+        recipients=recipients,
+        subject=str(payload.get("subject") or "").strip() or str(first["subject"] or ""),
+        items=[SourceItem(x["path"], role=str(x.get("role") or "sent")) for x in items],
+        selfcheck_path=selfcheck,
+        intake_id="",
+        intake_ids=intake_ids,
+        notes=str(payload.get("notes") or ""),
+        auto=True,
+    )
+    out = _after_issue(payload, request, gate.create_issue(request))
+    out["warnings"] = warnings + out["warnings"]
+    with gate.ledger.session() as connection:
+        check = autofile.verify_issues(
+            connection, [f["issue_id"] for f in out["files"]], request.intake_ids
+        )
+    out.update(
+        {
+            "auto": True,
+            "project_id": project_id,
+            "stage": stage,
+            "issue_date": issue_date.isoformat(),
+            "recipients": recipients,
+            "channels": channels,
+            "subject": request.subject,
+            "intake_ids": request.intake_ids,
+            "verify": check,
+            "verified": check["ok"],
+        }
+    )
+    if not check["ok"]:
+        out["alert"] = "✗ The check after filing did not pass: " + "; ".join(check["problems"])
+    return out
+
+
+def cmd_intake_auto(payload: dict) -> dict:
+    """The intake an agent files directly once "log it" has been said.
+
+    Arguments: `files` (list of paths; to keep subfolders use `items`: [{path, relative_name}]),
+    `source_org`, `project` (ID / short name / project name) and `stage` are required; whatever
+    is missing is reported, so the agent asks only for that. Optional: `source_person`,
+    `source_channel` (anything not in the list becomes "Other"), `received_date` (default
+    today), `subject`, `notes`, `todo` (default true: needs action).
+    "In reply to which issue" is always left empty; link it by hand afterwards if needed.
+    The return value carries the three-way check.
+    """
+    gate = _inbound(payload)
+    _outbound(payload)  # the projects table is set up by the issue gate
+    items = _auto_items(payload)
+    project_text = str(payload.get("project") or payload.get("project_id") or "").strip()
+    given = {
+        "files": bool(items),
+        "source organization": bool(str(payload.get("source_org") or "").strip()),
+        "project": bool(project_text),
+        "stage": bool(str(payload.get("stage") or "").strip()),
+    }
+    missing = [label for label, ok in given.items() if not ok]
+    if missing:
+        raise ValueError("Missing: " + ", ".join(missing) + ". Ask before filing.")
+    with gate.ledger.session() as connection:
+        project = _resolve_project(connection, project_text)
+    channel = vocab.program_word("source_channel", str(payload.get("source_channel") or "").strip())
+    if channel and channel not in SOURCE_CHANNELS:
+        channel = "Other"
+    received = (
+        _parse_date(str(payload["received_date"]), "Received date")
+        if payload.get("received_date")
+        else date.today()
+    )
+    request = IntakeRequest(
+        project_id=str(project["project_id"]),
+        project_name=str(project["project_name"] or ""),
+        source_org=str(payload.get("source_org") or ""),
+        source_person=str(payload.get("source_person") or ""),
+        source_channel=channel,
+        received_date=received,
+        subject=str(payload.get("subject") or ""),
+        items=[IntakeItem(x["path"], str(x.get("relative_name") or "")) for x in items],
+        todo=bool(payload.get("todo", True)),
+        notes=str(payload.get("notes") or ""),
+        stage=str(payload.get("stage") or ""),
+        archived=bool(payload.get("archived")),
+        auto=True,
+    )
+    result = gate.archive_intake(request)
+    _remember_stage(payload, request.project_id, request.stage)
+    if result.duplicate:
+        # The same files were received before: only a "received again" entry was recorded,
+        # nothing new landed on disk to check
+        check = {"ok": True, "files": [], "problems": []}
+    else:
+        with gate.ledger.session() as connection:
+            check = autofile.verify_intake(connection, result.record_id)
+    out = {
+        "auto": True,
+        "intake_id": result.record_id,
+        "project_id": request.project_id,
+        "stage": request.stage,
+        "archive_dir": str(result.archive_dir),
+        "file_count": result.file_count,
+        "total_size": result.total_size,
+        "duplicate": result.duplicate,
+        "todo": request.todo,
+        "warnings": result.warnings,
+        "verify": check,
+        "verified": check["ok"],
+    }
+    if not check["ok"]:
+        out["alert"] = "✗ The check after filing did not pass: " + "; ".join(check["problems"])
+    return out
+
+
+def cmd_issue_verify(payload: dict) -> dict:
+    """Check an issue batch again after the fact: source file, batch copy and ledger hash
+    compared three ways. Pass batch_id or issue_id."""
+    ledger = _ledger(payload)
+    if payload.get("batch_id"):
+        ids = [str(r["issue_id"]) for r in ledger.list_batch(str(payload["batch_id"]))]
+    else:
+        ids = [str(payload.get("issue_id") or "")]
+    if not [x for x in ids if x]:
+        raise ValueError("Which batch to check? Pass batch_id or issue_id.")
+    with ledger.session() as connection:
+        return autofile.verify_issues(connection, ids)
+
+
+def cmd_intake_verify(payload: dict) -> dict:
+    """Check an intake again after the fact: source file, archived copy and ledger hash
+    compared three ways."""
+    gate = _inbound(payload)
+    intake_id = str(payload.get("intake_id") or "").strip()
+    if not intake_id:
+        raise ValueError("Which intake to check? Pass intake_id.")
+    with gate.ledger.session() as connection:
+        return autofile.verify_intake(connection, intake_id)
+
+
 def cmd_relink_issue(payload: dict) -> dict:
     """Re-link an issue already in the ledger to another intake (or link an old record after the fact).
 
@@ -920,10 +1246,16 @@ def cmd_relink_issue(payload: dict) -> dict:
     not go through "withdraw and issue again". Once linked, that intake is closed right away,
     the same rule as when issuing (see cmd_issue_create).
     Arguments: one of issue_id / issue_ids / batch_id,
-    plus intake_id or intake_ids (as many as an issue can link; empty = unlink).
+    plus intake_id or intake_ids (as many as an issue can link, that many can be linked here).
+    mode (2026-11-09): the default `append` adds the given intakes to the existing ones, and
+    the link already there is not undone; `replace` is the old behaviour -- the list given is
+    the whole set after the change, and an empty list unlinks.
     """
     _inbound(payload)  # an old library may not have the intakes table yet
     ledger = _ledger(payload)
+    mode = str(payload.get("mode") or "append").strip()
+    if mode not in ("append", "replace"):
+        raise ValueError(f"mode can only be append or replace, not: {mode}")
     issue_ids = [str(x) for x in (payload.get("issue_ids") or [])]
     if payload.get("issue_id"):
         issue_ids.append(str(payload["issue_id"]))
@@ -932,14 +1264,18 @@ def cmd_relink_issue(payload: dict) -> dict:
     if not issue_ids:
         raise ValueError("Which issue should be re-linked? Pass issue_id, issue_ids or batch_id.")
 
-    # The list given is the whole set after the change (order as given; the first goes into issues.intake_id)
-    intake_ids = [str(x) for x in (payload.get("intake_ids") or []) if str(x)]
+    # Order as given; the first goes into issues.intake_id
+    given = [str(x) for x in (payload.get("intake_ids") or []) if str(x)]
     if payload.get("intake_id"):
-        intake_ids.append(str(payload["intake_id"]))
-    intake_ids = list(dict.fromkeys(intake_ids))
+        given.append(str(payload["intake_id"]))
+    given = list(dict.fromkeys(given))
+    if mode == "append" and not given:
+        raise ValueError(
+            "Append what? Pass intake_id or intake_ids; to undo the existing link use mode=replace."
+        )
 
     intakes = []
-    for intake_id in intake_ids:
+    for intake_id in given:
         intake = ledger.get_intake(intake_id)
         if intake is None:
             raise ValueError(f"The intake to link is not in the ledger: {intake_id}")
@@ -955,9 +1291,36 @@ def cmd_relink_issue(payload: dict) -> dict:
             if owner and owner.casefold() != str(issue["project_id"]).casefold():
                 raise ValueError("The intake to link does not belong to this project.")
 
-    ledger.relink_issue(issue_ids, intake_ids)
+    if mode == "replace":
+        ledger.relink_issue(issue_ids, given)
+        intake_ids = given
+    else:
+        # Appending is worked out per issue: the existing links come first (issues.intake_id
+        # stays), the new ones follow
+        intake_ids = []
+        existing: dict[str, list[str]] = {}
+        with ledger.session() as connection:
+            for issue_id in issue_ids:
+                linked = [
+                    str(r["intake_id"])
+                    for r in connection.execute(
+                        "SELECT intake_id FROM issue_intakes WHERE issue_id = ? ORDER BY rowid",
+                        (issue_id,),
+                    )
+                ]
+                if not linked:
+                    # Old records from before the link table only have one on issues.intake_id
+                    row = connection.execute(
+                        "SELECT intake_id FROM issues WHERE issue_id = ?", (issue_id,)
+                    ).fetchone()
+                    linked = [str(row["intake_id"])] if row and row["intake_id"] else []
+                existing[issue_id] = linked
+        for issue_id in issue_ids:
+            merged = list(dict.fromkeys(existing[issue_id] + given))
+            ledger.relink_issue([issue_id], merged)
+            intake_ids = list(dict.fromkeys(intake_ids + merged))
     warnings: list[str] = []
-    for intake_id in intake_ids:
+    for intake_id in given:
         try:
             _inbound(payload).set_todo(intake_id, False)
         except Exception as exc:  # the link is already changed; a failed close must not turn success into failure
@@ -1024,7 +1387,7 @@ def cmd_issue_role(payload: dict) -> dict:
             if new_role != old_role:
                 connection.execute(
                     "UPDATE issues SET role = ? WHERE issue_id = ?",
-                    (new_role, str(row["issue_id"])),
+                    (vocab.word("role", new_role), str(row["issue_id"])),
                 )
             changed.append(
                 {
@@ -1083,6 +1446,8 @@ def cmd_issues(payload: dict) -> dict:
     """
     _inbound(payload)  # make sure the intakes table exists, or the LEFT JOIN below empties the result
     ledger = _ledger(payload)
+    withdrawn = vocab.word("action", "withdrawn")
+    issued = vocab.word("action", "issued")
     clauses: list[str] = []
     params: list = []
     if payload.get("project_id"):
@@ -1096,6 +1461,12 @@ def cmd_issues(payload: dict) -> dict:
     if stage:
         clauses.append("(i.stage = ? OR i.stage = '')")
         params.append(stage)
+    if payload.get("auto_only"):
+        clauses.append(
+            "EXISTS (SELECT 1 FROM deliveries d WHERE d.issue_id = i.issue_id"
+            " AND d.action = ? AND d.auto = 1)"
+        )
+        params.append(issued)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit = int(payload.get("limit", 60))
     # Rows are fetched per file and only shrink once grouped into batches: fetch more, then
@@ -1110,14 +1481,17 @@ def cmd_issues(payload: dict) -> dict:
                 " COALESCE(NULLIF(p.folder, ''), i.project_id) AS folder,"
                 # Notes and recipients are both on the delivery log: take the latest non-withdrawal one
                 " (SELECT d.notes FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn'"  # the withdrawal row has empty notes and must not hide the real ones
+                "  AND d.action != ?"  # the withdrawal row has empty notes and must not hide the real ones
                 "  ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1) AS notes,"
                 " (SELECT d.recipients FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn'"
+                "  AND d.action != ?"
                 "  ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1) AS recipients,"
                 " (SELECT d.subject FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn'"
+                "  AND d.action != ?"
                 "  ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1) AS subject,"
+                # Whether an agent filed this batch: look at the "issued" entry that created it (2026-11-09)
+                " (SELECT COALESCE(MAX(d.auto), 0) FROM deliveries d WHERE d.issue_id = i.issue_id"
+                "  AND d.action = ?) AS auto,"
                 # The linked intake: whose request this version answers. There may be more than
                 # one -- the detail shows the first (intake_id column), intake_count gives the total
                 " i.intake_id, n.received_date AS intake_date, n.archived AS intake_archived,"
@@ -1129,7 +1503,7 @@ def cmd_issues(payload: dict) -> dict:
                 " FROM issues i LEFT JOIN projects p ON p.project_id = i.project_id"
                 " LEFT JOIN intakes n ON n.intake_id = i.intake_id"
                 f" {where} ORDER BY i.created_at DESC LIMIT ?",
-                params,
+                [withdrawn, withdrawn, withdrawn, issued, *params],
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
@@ -1145,8 +1519,9 @@ def cmd_undoable(payload: dict) -> dict:
         try:
             row = connection.execute(
                 "SELECT intake_id, received_date, source_org, subject, file_count, archive_dir"
-                " FROM intakes WHERE status = 'filed'"
-                " ORDER BY created_at DESC LIMIT 1"
+                " FROM intakes WHERE status = ?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (vocab.word("status", "filed"),),
             ).fetchone()
             if row:
                 out["intake"] = {
@@ -1160,8 +1535,9 @@ def cmd_undoable(payload: dict) -> dict:
             pass
 
         try:
-            clauses = ["status = 'issued'"]
-            params: list = []
+            issued = vocab.word("status", "issued")
+            clauses = ["status = ?"]
+            params: list = [issued]
             if project_id:
                 clauses.append("project_id = ? COLLATE NOCASE")
                 params.append(project_id)
@@ -1177,9 +1553,9 @@ def cmd_undoable(payload: dict) -> dict:
                 batch = (
                     connection.execute(
                         "SELECT file_name FROM issues"
-                        " WHERE batch_id = ? AND status = 'issued'"
+                        " WHERE batch_id = ? AND status = ?"
                         " ORDER BY created_at, rowid",
-                        (row["batch_id"],),
+                        (row["batch_id"], issued),
                     ).fetchall()
                     if row["batch_id"]
                     else [row]
@@ -1206,13 +1582,13 @@ def cmd_undoable(payload: dict) -> dict:
 # "Write notes" button and the file picked when issuing all point at it.
 # It has moved twice: the program's own folder (%LOCALAPPDATA%\Gateway\...) was impossible
 # for people to find, so on 2026-09-21 it moved to the desktop; drafts already issued piled
-# up there, so on 2026-09-26 it moved into the library root's _drafts\
-# (places.DRAFT_FOLDER), and the program deletes a draft once it has been issued (_consume_draft).
+# up there, so on 2026-09-26 it moved into the drafts folder at the library root
+# (places.draft_dir), and the program deletes a draft once it has been issued (_consume_draft).
 # The file name carries "ID-stage" to be recognisable (e.g. PRJ-2601-construction-drawings-change-notes.md).
 
 
 def _draft_dir(root: Path) -> Path:
-    return Path(root) / places.DRAFT_FOLDER
+    return places.draft_dir(root)
 
 
 def _draft_path(root: Path, project_id: str, stage: str) -> Path:
@@ -1220,7 +1596,7 @@ def _draft_path(root: Path, project_id: str, stage: str) -> Path:
         part for part in (str(project_id or "").strip(), str(stage or "").strip()) if part
     ) or "no-project"
     key = re.sub(r'[\\/:*?"<>|]+', "_", key)
-    return _draft_dir(root) / f"{key}-{SELFCHECK_FILENAME}"
+    return _draft_dir(root) / f"{key}-{places.files().change_notes}"
 
 
 def _payload_draft_path(payload: dict) -> Path:
@@ -1231,7 +1607,7 @@ def _payload_draft_path(payload: dict) -> Path:
 def _consume_draft(root: Path, source: str, landed: Path) -> str:
     """Delete the used draft once the issue is in the ledger (2026-09-26). Returns the deleted path, or an empty string.
 
-    Only drafts in _drafts\\ are deleted -- a .md picked by hand from elsewhere is the
+    Only drafts in the drafts folder are deleted -- a .md picked by hand from elsewhere is the
     person's own file and is left alone. Before deleting, compare it byte for byte with the
     copy that landed in the batch: when the whole batch is old content the program doesn't
     copy the notes at all, so the batch's copy is from last time, doesn't match, and the
@@ -1268,8 +1644,9 @@ def cmd_selfcheck_read(payload: dict) -> dict:
     raw = str(payload.get("path") or "").strip()
     path = Path(raw).expanduser() if raw else _payload_draft_path(payload)
     if path.suffix.lower() != ".md" or not path.is_file():
-        # There is only one skeleton: the library's template _admin\templates\change-notes.md;
-        # if it is missing, the built-in one in common.constants. The UI keeps no copy of its own.
+        # There is only one skeleton: the change-notes template in the library's admin
+        # templates folder; if it is missing, the built-in one in common.constants.
+        # The UI keeps no copy of its own.
         config = _config(payload)
         skeleton = library_check.selfcheck_skeleton(Path(config.library_root))
         return {"path": str(path), "text": skeleton, "exists": False}
@@ -1277,7 +1654,7 @@ def cmd_selfcheck_read(payload: dict) -> dict:
 
 
 def cmd_selfcheck_rename(payload: dict) -> dict:
-    """Rename the self-check notes in old batches to "change-notes.md".
+    """Rename the self-check notes in old batches to the configured change-notes name.
 
     Since 2026-08-27 the notes get this name when an issue lands; earlier batches are all
     over the place: "placeholder.md", "New Markdown Document.md", "selfcheck.md"... one style
@@ -1291,6 +1668,7 @@ def cmd_selfcheck_rename(payload: dict) -> dict:
     """
     apply = bool(payload.get("apply"))
     ledger = _ledger(payload)
+    notes_name = places.files().change_notes
 
     renames: list[dict] = []
     db_updates: list[tuple] = []
@@ -1313,10 +1691,10 @@ def cmd_selfcheck_rename(payload: dict) -> dict:
     for old_raw, group in groups.items():
         old_path = Path(old_raw)
         batch_dir = old_path.parent
-        target = batch_dir / SELFCHECK_FILENAME
+        target = batch_dir / notes_name
         ids = ", ".join(str(r["issue_id"])[:8] for r in group)
 
-        if old_path.name == SELFCHECK_FILENAME and old_path.is_file():
+        if old_path.name == notes_name and old_path.is_file():
             already.append(str(old_path))
             continue
 
@@ -1334,13 +1712,13 @@ def cmd_selfcheck_rename(payload: dict) -> dict:
             ]
             if len(loose) != 1:
                 problems.append(
-                    f"The notes in the ledger are not on disk, and no single .md can be identified in the folder"
-                    f" ({ids}, {len(loose)} candidates): {old_raw}"
+                    "The notes in the ledger are not on disk, and no single .md can be identified"
+                    f" in the folder ({ids}, {len(loose)} candidates): {old_raw}"
                 )
                 continue
             source = loose[0]
 
-        if source.name == SELFCHECK_FILENAME:
+        if source.name == notes_name:
             # The name is already right, the ledger just points elsewhere (renamed by hand) -- fix the ledger only
             db_updates.extend((str(source), r["issue_id"]) for r in group)
             renames.append({"from": str(old_raw), "to": str(source), "ledger_only": True})
@@ -1389,7 +1767,7 @@ def cmd_selfcheck_rename(payload: dict) -> dict:
             "SELECT issue_id, selfcheck_path FROM issues WHERE selfcheck_path <> ''"
         ):
             q = Path(str(row["selfcheck_path"]))
-            if q.name != SELFCHECK_FILENAME or not q.is_file():
+            if q.name != notes_name or not q.is_file():
                 missing.append(f"{str(row['issue_id'])[:8]}: {q}")
     result["missing_after"] = missing
     return result
@@ -1398,10 +1776,15 @@ def cmd_selfcheck_rename(payload: dict) -> dict:
 # 2026-09-11: issue folder names gained a "subject"; old batches are still "date-recipient".
 # Backfilling the subject follows the selfcheck-rename pattern: dry run for a person to look
 # at first, act only with apply.
-# Notes starting with "[Backfill" are a ledger-backfill template, not this batch's subject;
-# skip them when proposing candidates.
-LEDGER_BACKFILL_MARK = "[Backfill"
-SUBJECT_MAX = 40
+# Notes starting with the configured backfill marker (config "backfill_marker") were written
+# by a ledger backfill, not this batch's subject; they are skipped when proposing candidates.
+SUBJECT_MAX = 24
+# Where a long subject may be cut and what is trimmed off its ends. The full-width forms
+# (written as escapes) are kept because a ledger may hold CJK text.
+_CUT_MARKS = ",.:;\uff0c\u3002\uff1a\uff1b\u3001"
+_TRIM_MARKS = " .,-\u3002\uff0c\u3001"
+_OPEN_PARENS = ("(", "\uff08")
+_CLOSE_PARENS = (")", "\uff09")
 
 
 def _clean_subject(text: str) -> str:
@@ -1413,14 +1796,16 @@ def _clean_subject(text: str) -> str:
     """
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     text = text.replace("/", "-").replace("\\", "-")
-    text = re.sub(r'[<>:"|?*`]', "", text).strip(" .,;-")
+    text = re.sub(r'[<>:"|?*`]', "", text).strip(_TRIM_MARKS)
     if len(text) > SUBJECT_MAX:
         head = text[:SUBJECT_MAX]
-        cut = max(head.rfind(c) for c in ",.:;")
+        cut = max(head.rfind(c) for c in _CUT_MARKS)
         text = head[:cut] if cut >= SUBJECT_MAX // 2 else head
-        if text.count("(") > text.count(")"):
-            text = text[: text.rfind("(")]
-    return text.strip(" .,;-")
+        opened = sum(text.count(c) for c in _OPEN_PARENS)
+        closed = sum(text.count(c) for c in _CLOSE_PARENS)
+        if opened > closed:
+            text = text[: max(text.rfind(c) for c in _OPEN_PARENS)]
+    return text.strip(_TRIM_MARKS)
 
 
 def _subject_from_old_name(old_name: str, issue_date: str, recipients: str) -> str:
@@ -1451,8 +1836,10 @@ def _guess_subject(
     The intake's subject comes first: the issue answers that request, so it is this batch's
     title. Next is the topic in the old folder name (named by the old program), and only then
     the notes -- notes are often a throwaway line ("as needed", "keep it simple") that says
-    nothing as a folder name. Long backfill-template lines ("[Backfill...") are always skipped.
+    nothing as a folder name. Long backfill-template lines (starting with the backfill
+    marker) are always skipped.
     """
+    marker = active().backfill_marker
     candidates = [
         intake_subject,
         _subject_from_old_name(old_name, issue_date, recipients),
@@ -1460,7 +1847,7 @@ def _guess_subject(
         Path(file_names[0]).stem if file_names else "",
     ]
     for raw in candidates:
-        if not raw or str(raw).startswith(LEDGER_BACKFILL_MARK):
+        if not raw or str(raw).startswith(marker):
             continue
         picked = _clean_subject(raw)
         if picked:
@@ -1480,14 +1867,15 @@ def cmd_issue_subject(payload: dict) -> dict:
     Folder names belong to the program: new names go through make_batch_folder_name /
     unique_batch_dir as usual, collisions get -2.
     The ledger's three paths (output_dir / file_path / selfcheck_path) and deliveries.subject
-    follow; withdrawn files were moved to `_withdrawn` long ago, and paths not under this batch
-    folder are left alone.
+    follow; withdrawn files were moved to the withdrawn folder long ago, and paths not under
+    this batch folder are left alone.
     Dry run by default, apply=true to act; if a rename fails halfway, folders already renamed are rolled back.
     """
     apply = bool(payload.get("apply"))
     given = {str(k): str(v) for k, v in (payload.get("subjects") or {}).items()}
     only = {str(x) for x in (payload.get("batches") or [])}
     ledger = _ledger(payload)
+    withdrawn = vocab.word("action", "withdrawn")
 
     with ledger.session() as connection:
         rows = list(
@@ -1495,17 +1883,18 @@ def cmd_issue_subject(payload: dict) -> dict:
                 "SELECT i.issue_id, i.batch_id, i.issue_date, i.project_id, i.stage,"
                 " i.output_dir, i.file_path, i.file_name, i.selfcheck_path, i.status,"
                 " (SELECT d.recipients FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS recipients,"
                 " (SELECT d.subject FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS subject,"
                 " (SELECT d.notes FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS notes,"
                 " n.subject AS intake_subject"
                 " FROM issues i LEFT JOIN intakes n ON n.intake_id = i.intake_id"
-                " ORDER BY i.issue_date, i.created_at"
+                " ORDER BY i.issue_date, i.created_at",
+                (withdrawn, withdrawn, withdrawn),
             )
         )
 
@@ -1612,13 +2001,14 @@ def cmd_issue_subject(payload: dict) -> dict:
                 for row in plan.get("_group", groups[plan["batch"]]):
                     issue_id = str(row["issue_id"])
                     updates = {"output_dir": dst} if src != dst else {}
-                    # Withdrawn files were moved to _withdrawn long ago; only change paths still in this batch folder
+                    # Withdrawn files were moved to the withdrawn folder long ago; only change
+                    # paths still in this batch folder
                     for column in ("file_path", "selfcheck_path"):
                         old_value = str(row[column] or "")
                         if old_value and old_value.startswith(src):
                             updates[column] = dst + old_value[len(src):]
                     if str(row["status"]) != "issued" and "output_dir" in updates:
-                        # When the whole batch was withdrawn, output_dir points at _withdrawn, not this folder
+                        # When the whole batch was withdrawn, output_dir points at the withdrawn folder, not this one
                         if not str(row["output_dir"] or "").startswith(src):
                             updates.pop("output_dir")
                     if updates:
@@ -1630,8 +2020,8 @@ def cmd_issue_subject(payload: dict) -> dict:
                         )
                     connection.execute(
                         "UPDATE deliveries SET subject = ?"
-                        " WHERE issue_id = ? AND action != 'withdrawn'",
-                        (plan["subject"], issue_id),
+                        " WHERE issue_id = ? AND action != ?",
+                        (plan["subject"], issue_id, withdrawn),
                     )
     except Exception:
         for src, dst in reversed(done):
@@ -1650,10 +2040,10 @@ def cmd_issue_redate(payload: dict) -> dict:
     to the program, and the shape is always "date-recipient-subject".
     The key is `batch_id`, or `issue_id` for old records without one; every row of the batch changes.
     The ledger's three paths (output_dir / file_path / selfcheck_path) follow;
-    withdrawn files were moved to `_withdrawn` long ago, and paths not under this batch folder
-    are left alone. The recording time (created_at / deliveries.recorded_at) is not touched --
-    that is "when it was entered", a different fact. Dry run by default, apply=true to act;
-    if the rename fails it is rolled back.
+    withdrawn files were moved to the withdrawn folder long ago, and paths not under this batch
+    folder are left alone. The recording time (created_at / deliveries.recorded_at) is not
+    touched -- that is "when it was entered", a different fact. Dry run by default, apply=true
+    to act; if the rename fails it is rolled back.
     """
     apply = bool(payload.get("apply"))
     key = str(payload.get("batch") or payload.get("batch_id") or "").strip()
@@ -1661,6 +2051,7 @@ def cmd_issue_redate(payload: dict) -> dict:
         raise ValueError("Which batch? Pass batch (batch_id; issue_id for old records).")
     new_date = _parse_date(str(payload.get("issue_date") or ""), "Issue date")
     ledger = _ledger(payload)
+    withdrawn = vocab.word("action", "withdrawn")
 
     with ledger.session() as connection:
         rows = list(
@@ -1668,14 +2059,14 @@ def cmd_issue_redate(payload: dict) -> dict:
                 "SELECT i.issue_id, i.batch_id, i.issue_date, i.project_id, i.stage,"
                 " i.output_dir, i.file_path, i.file_name, i.selfcheck_path, i.status,"
                 " (SELECT d.recipients FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS recipients,"
                 " (SELECT d.subject FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS subject"
                 " FROM issues i WHERE i.batch_id = ? OR i.issue_id = ?"
                 " ORDER BY i.created_at, i.rowid",
-                (key, key),
+                (withdrawn, withdrawn, key, key),
             )
         )
     if not rows:
@@ -1724,7 +2115,7 @@ def cmd_issue_redate(payload: dict) -> dict:
             for row in rows:
                 updates = {"issue_date": new_date.isoformat()}
                 if src != dst:
-                    # When the whole batch was withdrawn, output_dir points at _withdrawn, not this batch folder
+                    # When the whole batch was withdrawn, output_dir points at the withdrawn folder, not this batch folder
                     if str(row["output_dir"] or "") == str(src):
                         updates["output_dir"] = str(dst)
                     for column in ("file_path", "selfcheck_path"):
@@ -1753,9 +2144,9 @@ def cmd_issue_recipients(payload: dict) -> dict:
     folder names belong to the program, the shape is always computed by make_batch_folder_name.
     The key is `batch_id`, or `issue_id` for old records without one; every row of the batch changes.
     The ledger changes deliveries.recipients and the three paths (output_dir / file_path /
-    selfcheck_path); the withdrawal entry is left alone, withdrawn files were moved to
-    `_withdrawn` long ago, and paths not under this batch folder are left alone. The manifest
-    is a snapshot of that moment and is not touched either.
+    selfcheck_path); the withdrawal entry is left alone, withdrawn files were moved to the
+    withdrawn folder long ago, and paths not under this batch folder are left alone. The
+    manifest is a snapshot of that moment and is not touched either.
     Dry run by default, apply=true to act; if the rename fails it is rolled back.
     """
     apply = bool(payload.get("apply"))
@@ -1764,6 +2155,7 @@ def cmd_issue_recipients(payload: dict) -> dict:
         raise ValueError("Which batch? Pass batch (batch_id; issue_id for old records).")
     recipients = validate_free_text(str(payload.get("recipients") or ""), "Recipient")
     ledger = _ledger(payload)
+    withdrawn = vocab.word("action", "withdrawn")
 
     with ledger.session() as connection:
         rows = list(
@@ -1771,14 +2163,14 @@ def cmd_issue_recipients(payload: dict) -> dict:
                 "SELECT i.issue_id, i.batch_id, i.issue_date, i.project_id, i.stage,"
                 " i.output_dir, i.file_path, i.file_name, i.selfcheck_path, i.status,"
                 " (SELECT d.recipients FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS recipients,"
                 " (SELECT d.subject FROM deliveries d WHERE d.issue_id = i.issue_id"
-                "  AND d.action != 'withdrawn' ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
+                "  AND d.action != ? ORDER BY d.recorded_at DESC, d.rowid DESC LIMIT 1)"
                 "   AS subject"
                 " FROM issues i WHERE i.batch_id = ? OR i.issue_id = ?"
                 " ORDER BY i.created_at, i.rowid",
-                (key, key),
+                (withdrawn, withdrawn, key, key),
             )
         )
     if not rows:
@@ -1826,7 +2218,7 @@ def cmd_issue_recipients(payload: dict) -> dict:
             for row in rows:
                 updates: dict[str, str] = {}
                 if src != dst:
-                    # When the whole batch was withdrawn, output_dir points at _withdrawn, not this batch folder
+                    # When the whole batch was withdrawn, output_dir points at the withdrawn folder, not this batch folder
                     if str(row["output_dir"] or "") == str(src):
                         updates["output_dir"] = str(dst)
                     for column in ("file_path", "selfcheck_path"):
@@ -1842,8 +2234,8 @@ def cmd_issue_recipients(payload: dict) -> dict:
                     )
                 connection.execute(
                     "UPDATE deliveries SET recipients = ?"
-                    " WHERE issue_id = ? AND action != 'withdrawn'",
-                    (recipients, str(row["issue_id"])),
+                    " WHERE issue_id = ? AND action != ?",
+                    (recipients, str(row["issue_id"]), withdrawn),
                 )
     except Exception:
         if renamed and dst.exists() and not src.exists():
@@ -2048,7 +2440,8 @@ def cmd_issue_resync(payload: dict) -> dict:
             connection.execute(
                 "SELECT issue_id, issue_date, output_dir, file_path, file_name,"
                 " file_hash, selfcheck_path, status FROM issues"
-                " WHERE status = 'issued' ORDER BY created_at"
+                " WHERE status = ? ORDER BY created_at",
+                (vocab.word("status", "issued"),),
             )
         )
 
@@ -2151,9 +2544,9 @@ def _recipients_and_notes(connection, issue_id: str) -> tuple[str, str, str]:
     """This batch's recipient / subject / notes -- all three are on the delivery log; take the latest non-withdrawal one."""
     row = connection.execute(
         "SELECT recipients, subject, notes FROM deliveries"
-        " WHERE issue_id = ? AND action != 'withdrawn'"
+        " WHERE issue_id = ? AND action != ?"
         " ORDER BY recorded_at DESC, rowid DESC LIMIT 1",
-        (issue_id,),
+        (issue_id, vocab.word("action", "withdrawn")),
     ).fetchone()
     if row is None:
         return ("", "", "")
@@ -2280,7 +2673,7 @@ def cmd_issue_detail(payload: dict) -> dict:
         deliveries = _rows(
             connection.execute(
                 f"SELECT d.issue_id, d.recorded_at, d.purpose, d.channels_json, d.recipients,"
-                f" d.subject, d.notes, d.action, i.file_name FROM deliveries d"
+                f" d.subject, d.notes, d.action, d.auto, i.file_name FROM deliveries d"
                 f" JOIN issues i ON i.issue_id = d.issue_id"
                 f" WHERE d.issue_id IN ({marks}) ORDER BY d.recorded_at, d.rowid",
                 member_ids,
@@ -2335,6 +2728,7 @@ def cmd_issue_detail(payload: dict) -> dict:
             "subject": subject,
             "notes": notes,
             "issue_ids": member_ids,
+            "auto": any(d["auto"] for d in deliveries if d["action"] == "issued"),
         }
     )
     selfcheck = ""
@@ -2389,6 +2783,10 @@ COMMANDS = {
     "issue-create": cmd_issue_create,
     "issues": cmd_issues,
     "withdraw-issue": cmd_withdraw_issue,
+    "issue-auto": cmd_issue_auto,
+    "intake-auto": cmd_intake_auto,
+    "issue-verify": cmd_issue_verify,
+    "intake-verify": cmd_intake_verify,
     "relink-issue": cmd_relink_issue,
     "undoable": cmd_undoable,
     "selfcheck-draft": cmd_selfcheck_draft,

@@ -6,11 +6,12 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from common.constants import SELFCHECK_FILENAME, SELFCHECK_SKELETON
-from common.places import INBOX_FOLDER, OUTBOX_FOLDER, POOL_FOLDER
+from common.constants import SELFCHECK_SKELETON
 from gate_api import cli, library_check
 from inbound_gate import InboundGate, IntakeItem, IntakeRequest
 from outbound_gate import OutboundGate
+
+CHANGE_NOTES = "change-notes.md"
 
 
 class LibraryCheckTests(unittest.TestCase):
@@ -22,7 +23,8 @@ class LibraryCheckTests(unittest.TestCase):
         self.inbound = InboundGate(self.root, self.ledger_path)
         (self.root / "_admin" / "templates").mkdir(parents=True)
         (self.root / "_admin" / "templates" / "project-AGENTS.md").write_text(
-            "# {{short_name}} ({{project_id}})\n## Project card\n{{full_name}}\n## Layout\n## Ground rules\n## Start here\n",
+            "# {{short_name}} ({{project_id}})\n## Project card\n{{full_name}}\n## Layout\n"
+            "## Ground rules\n## Start here\n",
             encoding="utf-8",
         )
         (self.root / "README.md").write_text("# Spec\n", encoding="utf-8")
@@ -54,10 +56,10 @@ class LibraryCheckTests(unittest.TestCase):
         # The CLAUDE.md next to it is only a one-line pointer; at room or stage level it is not a loose file
         self.assertEqual((self.root / "riverside" / "CLAUDE.md").read_bytes(), b"@AGENTS.md\n")
         stage = self.root / "riverside" / "preliminary-design"
-        (stage / POOL_FOLDER).mkdir(parents=True)
+        (stage / "current").mkdir(parents=True)
         (stage / "AGENTS.md").write_text("# preliminary-design\n", encoding="utf-8")
         (stage / "CLAUDE.md").write_bytes(b"@AGENTS.md\n")
-        (stage / POOL_FOLDER / "index.md").write_text("| Deliverable | Files | Notes |\n", encoding="utf-8")
+        (stage / "current" / "index.md").write_text("| Deliverable | Files | Notes |\n", encoding="utf-8")
         report = cli.cmd_library_check(self.payload())
         mine = [x for x in report["findings"] if x["room"] == "riverside"]
         self.assertEqual(mine, [])
@@ -69,10 +71,10 @@ class LibraryCheckTests(unittest.TestCase):
         (house / "plot.log").write_text("x", encoding="utf-8")                          # loose file in room + log junk
         (house / "BIM-delivery").mkdir()                                                 # non-stage folder in room
         (stage / "tmp").mkdir(parents=True)                                              # non-standard position
-        (stage / INBOX_FOLDER / "exchange" / "2026.08.01-client-x").mkdir(parents=True)  # folder not in ledger
-        (stage / OUTBOX_FOLDER / "2026.08.02-client").mkdir(parents=True)                # batch folder, but not in the ledger
-        (stage / POOL_FOLDER).mkdir()
-        (stage / POOL_FOLDER / "site-plan-final.dwg").write_bytes(b"AC1032")             # unsortable name
+        (stage / "inbox" / "exchange" / "2026.08.01-client-x").mkdir(parents=True)       # folder not in ledger
+        (stage / "outbox" / "2026.08.02-client").mkdir(parents=True)                     # batch folder, but not in the ledger
+        (stage / "current").mkdir()
+        (stage / "current" / "site-plan-final.dwg").write_bytes(b"AC1032")               # unsortable name
         (house / "AGENTS.md").write_text("# riverside\n## Project card\n", encoding="utf-8")  # incomplete guide
         (self.root / "stray-room").mkdir()                                               # room not registered
         report = cli.cmd_library_check(self.payload())
@@ -107,9 +109,9 @@ class LibraryCheckTests(unittest.TestCase):
         report = cli.cmd_library_check(self.payload())
         missing = {x["where"] for x in report["findings"] if x["what"] == "missing template"}
         self.assertEqual(len(missing), 2)
-        for name in ("stage-AGENTS.md", SELFCHECK_FILENAME):
+        for name in ("stage-AGENTS.md", CHANGE_NOTES):
             self.assertTrue(any(name in w for w in missing), name)
-        cli.cmd_template_save(self.payload(name=SELFCHECK_FILENAME, text="# Skeleton\n## What changed\n"))
+        cli.cmd_template_save(self.payload(name=CHANGE_NOTES, text="# Skeleton\n## What changed\n"))
         report = cli.cmd_library_check(self.payload())
         missing = {x["where"] for x in report["findings"] if x["what"] == "missing template"}
         self.assertEqual(len(missing), 1)
@@ -143,12 +145,12 @@ class LibraryCheckTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cli.cmd_template_save(self.payload(name="..\\..\\escape.md", text="x"))
         with self.assertRaises(ValueError):
-            cli.cmd_template_save(self.payload(name=SELFCHECK_FILENAME, text="   \n"))
+            cli.cmd_template_save(self.payload(name=CHANGE_NOTES, text="   \n"))
 
     def test_selfcheck_skeleton_prefers_the_template_on_disk(self) -> None:
         root = self.root
         self.assertEqual(library_check.selfcheck_skeleton(root), SELFCHECK_SKELETON)  # fallback
-        cli.cmd_template_save(self.payload(name=SELFCHECK_FILENAME, text="# Self-check\n## My own skeleton\n"))
+        cli.cmd_template_save(self.payload(name=CHANGE_NOTES, text="# Self-check\n## My own skeleton\n"))
         self.assertIn("My own skeleton", library_check.selfcheck_skeleton(root))
         # The task card and the issue page's "Write notes" must both follow the edited template
         letter = Path(self.temp.name) / "a.pdf"
@@ -180,7 +182,7 @@ class LibraryCheckTests(unittest.TestCase):
         self.assertTrue(data["charter"]["exists"])
         self.assertTrue(data["templates"]["project-AGENTS.md"]["exists"])
         # When the change-notes template is not on disk, the built-in skeleton is shown (saving it creates the file)
-        skeleton = data["templates"][SELFCHECK_FILENAME]
+        skeleton = data["templates"][CHANGE_NOTES]
         self.assertFalse(skeleton["exists"])
         self.assertTrue(skeleton["builtin"])
         self.assertIn("## What changed", skeleton["text"])

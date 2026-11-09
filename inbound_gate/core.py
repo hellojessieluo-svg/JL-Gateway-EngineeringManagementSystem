@@ -10,11 +10,10 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
+from common import places, vocab
 from common.errors import ConflictError, StorageError, ValidationError
-from common.constants import STAGES
 from common.naming import ensure_path_length, validate_component
 from common.places import (
-    WITHDRAWN_FOLDER,
     folder_in_connection,
     inbox_dir,
 )
@@ -37,31 +36,28 @@ from .naming import (
 )
 
 
-# Without ledger_path, fall back to the ledger at the library root -- the same one the issue
-# gate uses; the two gates have always shared one ledger.
-LEDGER_FILENAME = "ledger.db"
-
-
 class InboundGate:
-    """Intake gate: store what others send me exactly as received, and keep a record."""
+    """Intake gate: file what others give me exactly as received, and leave a trace."""
 
     def __init__(
         self,
         library_root: Path | str,
         ledger_path: Path | str | None = None,
     ):
-        # The root is the whole library: intake lands under <root>\<project room>\...\inbox\;
-        # there is no top-level intake area any more.
+        # The root is the whole library: intake lands under <root>\<room>\<stage>\inbox\;
+        # there is no top-level inbox any more.
         self.library_root = Path(library_root)
-        # Without ledger_path, fall back to the ledger at the root, so tests and old data still work.
+        # Without ledger_path, fall back to the ledger at the library root -- the same ledger
+        # as the issue gate; the two gates have always shared one ledger.
         self.ledger = IntakeLedger(
-            Path(ledger_path) if ledger_path else self.library_root / LEDGER_FILENAME
+            Path(ledger_path) if ledger_path else self.library_root / places.files().ledger
         )
         self.ledger.initialize()
 
     def _stage_or_fallback(self, stage: str) -> str:
-        """Which stage the withdrawn pile hangs under: old records from before the change have an empty stage, fall back to "other"."""
-        return stage or "other"
+        """Which stage the withdrawn pile hangs under: old records from before the change have
+        an empty stage, so fall back to the last stage."""
+        return stage or places.fallback_stage()
 
     def _project_folder(self, project_id: str) -> str:
         with self.ledger.session() as connection:
@@ -98,12 +94,12 @@ class InboundGate:
 
             target_name = archived_name(resolved, item.relative_name, taken)
             if target_name.casefold() in taken:
-                raise ValidationError(f"Filing would produce duplicate file names: {target_name}")
+                raise ValidationError(f"Filing would produce two files with the same name: {target_name}")
             taken.add(target_name.casefold())
 
             for previous in self.ledger.find_file_hash(source_hash):
                 warnings.append(
-                    f"{resolved.name} has the same content as an already filed file: "
+                    f"{resolved.name} has the same content as a filed file: "
                     f"{previous['happened_on']} {previous['source']} "
                     f"{previous['archived_name']}"
                 )
@@ -132,7 +128,7 @@ class InboundGate:
             shutil.copy2(item.source_path, destination)
             after = item.source_path.stat()
             if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
-                raise StorageError(f"Source file changed during copying: {item.source_path}")
+                raise StorageError(f"The source file changed during the copy: {item.source_path}")
             if sha256_file(destination) != item.source_hash:
                 raise StorageError(f"Hash mismatch after copying: {item.source_path}")
 
@@ -155,10 +151,11 @@ class InboundGate:
         if request.project_id:
             validate_component(request.project_id, "Project ID")
         if request.source_channel and request.source_channel not in SOURCE_CHANNELS:
-            raise ValidationError(f"Unsupported channel: {request.source_channel}")
-        # Everything has a stage -- intake lands in <room>\<stage>\inbox\; there is no place outside a stage
-        if request.stage not in STAGES:
-            raise ValidationError(f"Unsupported stage: {request.stage or '(none selected)'}")
+            raise ValidationError(f"Unsupported receiving channel: {request.source_channel}")
+        # Every document has a stage -- intake lands in <room>\<stage>\inbox\; there is no
+        # place to store it outside a stage
+        if request.stage not in places.stages():
+            raise ValidationError(f"Unsupported stage: {request.stage or '(none chosen)'}")
         if not request.items:
             raise ValidationError("Add at least one incoming file.")
 
@@ -177,8 +174,9 @@ class InboundGate:
         parent = inbox_dir(
             self.library_root, self._project_folder(request.project_id), request.stage
         )
-        # The "Archive" flag (archived) is just one bit in the ledger: this is important, keep it well.
-        # Since 2026-09-08 it no longer moves files -- every batch sits directly under inbox\.
+        # The "Archive" flag (archived) is just one bit in the ledger: this item matters and
+        # should be kept well. Since 2026-09-08 it no longer moves files -- every batch sits
+        # directly under inbox\.
         final_dir = unique_directory(parent, folder)
         for item in checked_files:
             ensure_path_length(final_dir / item.archived_name)
@@ -186,6 +184,7 @@ class InboundGate:
         total_size = sum(item.size for item in checked_files)
         record_id = str(uuid.uuid4())
         created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        source_channel = vocab.word("source_channel", request.source_channel)
         manifest = {
             "schema_version": 1,
             "intake_id": record_id,
@@ -195,13 +194,14 @@ class InboundGate:
             "project_name": request.project_name,
             "source_org": request.source_org,
             "source_person": request.source_person,
-            "source_channel": request.source_channel,
+            "source_channel": source_channel,
             "received_date": request.received_date.isoformat(),
             "subject": request.subject,
             "todo": request.todo,
             "notes": request.notes,
             "stage": request.stage,
             "replies_to": request.replies_to,
+            "auto": request.auto,
             "content_signature": signature,
             "files": [
                 {
@@ -222,6 +222,7 @@ class InboundGate:
         temp_parent.mkdir(parents=True, exist_ok=True)
         temp_dir = Path(tempfile.mkdtemp(prefix="intake-", dir=temp_parent))
         moved = False
+        filed = vocab.word("status", STATUS_ARCHIVED)
         try:
             self._copy_into(temp_dir, checked_files)
             with self.ledger.immediate_transaction() as connection:
@@ -232,14 +233,14 @@ class InboundGate:
                       AND content_signature = ? AND status = ?
                     LIMIT 1
                     """,
-                    (request.project_id, signature, STATUS_ARCHIVED),
+                    (request.project_id, signature, filed),
                 ).fetchone()
                 if existing:
-                    raise ConflictError("The same content was filed while registering; check again.")
+                    raise ConflictError("The same content was filed while logging; check again.")
 
                 final_dir.parent.mkdir(parents=True, exist_ok=True)
                 if final_dir.exists():
-                    raise ConflictError(f"Target folder already exists, refusing to overwrite: {final_dir}")
+                    raise ConflictError(f"The target folder already exists, refusing to overwrite: {final_dir}")
                 temp_dir.rename(final_dir)
                 moved = True
 
@@ -250,8 +251,8 @@ class InboundGate:
                         source_org, source_person, source_channel, received_date, subject,
                         archive_dir, content_signature, file_count, total_size,
                         todo, handled_at, notes, manifest_json, status,
-                        stage, replies_to
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                        stage, replies_to, auto
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record_id,
@@ -261,7 +262,7 @@ class InboundGate:
                         request.project_name,
                         request.source_org,
                         request.source_person,
-                        request.source_channel,
+                        source_channel,
                         request.received_date.isoformat(),
                         request.subject,
                         str(final_dir),
@@ -271,9 +272,10 @@ class InboundGate:
                         1 if request.todo else 0,
                         request.notes,
                         json.dumps(manifest, ensure_ascii=False),
-                        STATUS_ARCHIVED,
+                        filed,
                         request.stage,
                         request.replies_to,
+                        1 if request.auto else 0,
                     ),
                 )
                 for item in checked_files:
@@ -301,16 +303,17 @@ class InboundGate:
                     INSERT INTO receipts(
                         receipt_id, intake_id, recorded_at, source_org,
                         source_channel, received_date, notes, action
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'filed')
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
                         record_id,
                         created_at,
                         request.source_org,
-                        request.source_channel,
+                        source_channel,
                         request.received_date.isoformat(),
                         request.notes,
+                        vocab.word("action", "filed"),
                     ),
                 )
             return IntakeResult(
@@ -332,7 +335,7 @@ class InboundGate:
     def _record_again(
         self, row: sqlite3.Row, request: IntakeRequest, warnings: list[str]
     ) -> IntakeResult:
-        """The same set of files arrived again: do not store another copy, just add a receipt."""
+        """The same batch of files received again: don't store another copy, just add a receipt."""
         archive_dir = Path(row["archive_dir"])
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         self.ledger.add_receipt(
@@ -346,8 +349,8 @@ class InboundGate:
             action="received again",
         )
         warnings.append(
-            f"These files are identical to the ones received on {row['received_date']} from {row['source_org']}; "
-            "recorded one \"received again\" entry without storing another copy."
+            f"These files are identical to what was received from {row['source_org']} on"
+            f" {row['received_date']}; one \"received again\" was recorded, nothing was stored twice."
         )
         return IntakeResult(
             kind="intake",
@@ -366,25 +369,25 @@ class InboundGate:
     ) -> Path:
         resolved_root = self.library_root.resolve()
         if not source.exists() or not source.is_dir():
-            raise StorageError(f"Batch folder no longer exists, cannot withdraw: {source}")
+            raise StorageError(f"The archive folder no longer exists and cannot be withdrawn: {source}")
         if source.is_symlink():
-            raise StorageError(f"Batch folder is a link, refusing to withdraw: {source}")
+            raise StorageError(f"The archive folder is a link, refusing to withdraw: {source}")
         resolved_source = source.resolve()
         if resolved_source == resolved_root or resolved_root not in resolved_source.parents:
-            raise StorageError(f"Batch folder is outside this library, refusing to withdraw: {resolved_source}")
+            raise StorageError(f"The archive folder is outside this library, refusing to withdraw: {resolved_source}")
 
         # Withdrawn items follow their project room and stage; there is no top-level withdrawn pile
         withdrawn_root = (
             inbox_dir(self.library_root, self._project_folder(project_id), self._stage_or_fallback(stage))
-            / WITHDRAWN_FOLDER
+            / places.names().withdrawn
         )
         if withdrawn_root.exists() and withdrawn_root.is_symlink():
-            raise StorageError(f"Withdrawn folder is a link, refusing to proceed: {withdrawn_root}")
+            raise StorageError(f"The withdrawn folder is a link, refusing to continue: {withdrawn_root}")
         withdrawn_root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         target = withdrawn_root / f"{stamp}-{record_id[:8]}-{source.name}"
         if target.exists():
-            raise StorageError(f"Withdrawal target already exists: {target}")
+            raise StorageError(f"The withdraw target already exists: {target}")
         shutil.move(str(resolved_source), str(target))
         return target
 
@@ -410,16 +413,16 @@ class InboundGate:
     # ------------------------------------------------------------------ change stage
 
     def restage_intake(self, intake_id: str, stage: str, apply: bool = False) -> dict:
-        """The wrong stage was picked at registration: move this intake, files and record, to another stage.
+        """The wrong stage was picked at logging: move this intake, files and all, under another stage.
 
         The stage is not an isolated field in the ledger, it is part of the address
-        (room\\stage\\inbox\\<batch>), so changing it = moving the folder + updating the
-        ledger, and both must succeed together. No file content is touched; the whole batch
-        folder moves as is; a name clash gets -2, the same rule as everywhere else.
-        By default this is a dry run that only reports "from where to where"; apply=true actually moves.
+        (room\\stage\\inbox\\<batch>), so changing it = moving the folder + changing the ledger,
+        and both must succeed together. No file content changes; the whole batch folder moves
+        as is; a name clash gets -2, like everywhere else.
+        By default this is a dry run that only reports "from where to where"; apply=true moves.
         """
-        if stage not in STAGES:
-            raise ValidationError(f"Unsupported stage: {stage or '(none selected)'}")
+        if stage not in places.stages():
+            raise ValidationError(f"Unsupported stage: {stage or '(none chosen)'}")
         row = self.ledger.get_intake(intake_id)
         if row is None:
             raise ValueError("Intake record not found.")
@@ -448,16 +451,16 @@ class InboundGate:
         )
         resolved_root = self.library_root.resolve()
         if not source.is_dir():
-            raise StorageError(f"Batch folder no longer exists; put the files back before changing the stage: {source}")
+            raise StorageError(f"The archive folder no longer exists; put the files back before changing the stage: {source}")
         if source.is_symlink():
-            raise StorageError(f"Batch folder is a link, refusing to move: {source}")
+            raise StorageError(f"The archive folder is a link, refusing to move it: {source}")
         resolved_source = source.resolve()
         if resolved_source == resolved_root or resolved_root not in resolved_source.parents:
-            raise StorageError(f"Batch folder is outside this library, refusing to move: {resolved_source}")
+            raise StorageError(f"The archive folder is outside this library, refusing to move it: {resolved_source}")
 
         if not apply:
-            # A dry run creates no folders: the target name is based on "is there a clash on
-            # disk right now", which is enough for a person to review
+            # A dry run creates no folders: the target name is computed from "is there a
+            # same-named folder on disk right now", which is enough for a person to review
             target = parent / source.name
             if target.exists():
                 target = parent / f"{source.name}-2"
@@ -469,7 +472,8 @@ class InboundGate:
         try:
             self.ledger.restage_intake(intake_id, stage, str(target))
         except Exception:
-            # If the ledger update failed, move the files back: better both old than a ledger/disk mismatch
+            # If the ledger could not change, move the files back: better both old than ledger
+            # and disk disagreeing
             if target.exists() and not source.exists():
                 shutil.move(str(target), str(source))
             raise
@@ -478,24 +482,24 @@ class InboundGate:
     # ------------------------------------------------------------------ change source
 
     def change_source(self, intake_id: str, source_org: str, apply: bool = False) -> dict:
-        """The source was mistyped at registration: change this intake's source and rename its folder.
+        """The source organization was mistyped at logging: change it, and rename the folder with it.
 
-        Like the stage, the source is part of the address
-        (room\\stage\\inbox\\<date-source-subject>), so changing it = renaming + updating the
-        ledger, and both must succeed together; changing only the ledger cell would leave it
-        pointing at a place that does not exist. No file is touched; the whole batch folder is
-        renamed in place, a clash gets -2. The receipts log carries the same mistyped word and
-        is fixed too; the registration time stays -- that is "when it was recorded", a
-        separate fact. Only "filed" records qualify: withdrawn ones sit in "_withdrawn" with a
-        timestamp in the folder name, which is another story.
-        By default this is a dry run that only reports "from where to where"; apply=true actually renames.
+        Like the stage, the source is part of the address (room\\stage\\inbox\\<date-source-subject>),
+        so changing it = renaming + changing the ledger, and both must succeed together;
+        changing only the ledger cell would leave it pointing at a place that does not exist.
+        No file is touched; the whole batch folder is renamed in place, a name clash gets -2.
+        The receipt rows recorded the same mistyped word and change with it; the logging time
+        does not -- "when the ledger was written" is a different fact. Only "filed" records
+        qualify: withdrawn ones sit in the withdrawn folder with a timestamped name and have
+        their own rules.
+        By default this is a dry run that only reports "from where to where"; apply=true renames.
         """
         source_org = validate_free_text(source_org, "Source")
         row = self.ledger.get_intake(intake_id)
         if row is None:
             raise ValueError("Intake record not found.")
         if row["status"] != STATUS_ARCHIVED:
-            raise ValueError("Only \"filed\" records can change source.")
+            raise ValueError("Only \"filed\" records can change their source.")
 
         was = str(row["source_org"] or "")
         source = Path(row["archive_dir"])
@@ -512,8 +516,8 @@ class InboundGate:
         if was == source_org:
             return {**plan, "changed": False, "dry_run": not apply}
 
-        # The new folder name is computed by the program, not by string replacement on the
-        # old one: date and subject stay, the source is the new one
+        # The new folder name is computed by the program, not by string-replacing the old one:
+        # date and subject stay, the source is the new one
         new_name = intake_folder_name(
             date.fromisoformat(str(row["received_date"])),
             source_org,
@@ -521,16 +525,16 @@ class InboundGate:
         )
         resolved_root = self.library_root.resolve()
         if not source.is_dir():
-            raise StorageError(f"Batch folder no longer exists; put the files back before changing the source: {source}")
+            raise StorageError(f"The archive folder no longer exists; put the files back before changing the source: {source}")
         if source.is_symlink():
-            raise StorageError(f"Batch folder is a link, refusing to rename: {source}")
+            raise StorageError(f"The archive folder is a link, refusing to rename it: {source}")
         resolved_source = source.resolve()
         if resolved_source == resolved_root or resolved_root not in resolved_source.parents:
-            raise StorageError(f"Batch folder is outside this library, refusing to rename: {resolved_source}")
+            raise StorageError(f"The archive folder is outside this library, refusing to rename it: {resolved_source}")
 
         if not apply:
-            # A dry run creates no folders: the target name is based on "is there a clash on
-            # disk right now", which is enough for a person to review
+            # A dry run creates no folders: the target name is computed from "is there a
+            # same-named folder on disk right now", which is enough for a person to review
             target = source.parent / new_name
             if target.exists():
                 target = source.parent / f"{new_name}-2"
@@ -543,7 +547,8 @@ class InboundGate:
         try:
             self.ledger.change_intake_source(intake_id, source_org, str(target))
         except Exception:
-            # If the ledger update failed, rename the folder back: better both old than a ledger/disk mismatch
+            # If the ledger could not change, rename the folder back: better both old than
+            # ledger and disk disagreeing
             if target.exists() and not source.exists():
                 shutil.move(str(target), str(source))
             raise
@@ -552,17 +557,18 @@ class InboundGate:
     # ------------------------------------------------------------------ delete
 
     def delete_intake(self, intake_id: str) -> dict:
-        """Delete a wrongly registered intake: files move into "_withdrawn", the ledger row is removed outright.
+        """Delete an intake that was logged by mistake: files move into the withdrawn folder, the row is removed from the ledger.
 
-        No file is ever destroyed -- the row was wrong, not the files. For a record that was
-        already withdrawn, the files are already in "_withdrawn", so only the row is removed.
+        Not a single file is destroyed -- what was wrong is the row, not the files. For a
+        record already withdrawn, the files are already in the withdrawn folder, so only the
+        row is erased.
         """
         row = self.ledger.get_intake(intake_id)
         if row is None:
             raise ValueError("Intake record not found.")
         source = Path(row["archive_dir"])
-        # Do not block if the folder was deleted by hand: the row is being removed anyway,
-        # no point getting stuck on a folder that does not exist
+        # If the folder was already deleted by hand, don't block: this row is meant to go
+        # anyway, don't get stuck on a folder that does not exist
         files_at = ""
         if source.is_dir():
             files_at = (
@@ -582,4 +588,4 @@ class InboundGate:
         self.ledger.set_todo(intake_id, todo, handled_at)
 
 
-__all__ = ["InboundGate", "LEDGER_FILENAME"]
+__all__ = ["InboundGate"]

@@ -4,11 +4,11 @@ import re
 from datetime import date
 from pathlib import Path
 
+from common.config import active
 from common.errors import ValidationError
 
 
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-DISCOURAGED_WORDS = ("final", "latest", "new", "copy")
 # The intake gate uses this to stop overlong batch folder names; the issue gate no longer
 # makes up names, so this is its only remaining use.
 MAX_FILENAME_LENGTH = 180
@@ -35,7 +35,8 @@ def validate_component(value: str, label: str, *, allow_empty: bool = False) -> 
     if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
         raise ValidationError(f"{label} cannot be a Windows reserved name: {value}")
     lowered = value.casefold()
-    for word in DISCOURAGED_WORDS:
+    # The words come from config.json "discouraged_words"
+    for word in active().discouraged_words:
         # Whole words only: "renewal" or "finalize" are fine, "plan_final" is not
         if re.search(rf"(?<![a-z]){re.escape(word.casefold())}(?![a-z])", lowered):
             raise ValidationError(f"{label} should not contain the unsortable word \"{word}\".")

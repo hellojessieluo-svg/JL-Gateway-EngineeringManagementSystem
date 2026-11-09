@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from common.errors import ValidationError
-from common.constants import ALLOWED_EXTENSIONS
+from common.constants import STRUCTURE_CHECKED_EXTENSIONS
 from common.validators import sha256_file, structural_checks
 
 from .models import BLOCKED_SUFFIXES, OFFICE_TEMP_PREFIX
@@ -30,7 +30,7 @@ def inspect_file(path: Path) -> tuple[int, str, list[str], list[str]]:
 
     checks = ["File exists, is readable and not empty"]
     warnings: list[str] = []
-    if suffix in ALLOWED_EXTENSIONS:
+    if suffix in STRUCTURE_CHECKED_EXTENSIONS:
         try:
             checks.extend(structural_checks(path))
         except ValidationError as exc:

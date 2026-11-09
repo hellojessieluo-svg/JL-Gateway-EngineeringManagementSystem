@@ -1,30 +1,32 @@
-r"""Standards index: the current standards and regulations among cross-project reference
-material, one per row (2026-09-08; split into categories 2026-09-21).
+r"""Standards index: the current standards and regulations in the cross-project reference
+material, one row each (2026-09-08; categories since 2026-09-21).
 
-Disk is the source of truth -- under `_reference\` (common.config.DEFAULT_REFERENCE_ROOT,
-by default ~/WorkLibrary/_reference) sit three parallel categories, and whatever is there gets
-listed (the category table is common.config.STANDARD_CATEGORIES):
+The disk is the truth -- the categories under the reference root (config reference_root,
+default `<library>\_reference`) are listed as they are (the category table is
+config standard_categories; default names below):
 
-  Technical standards   `standards\`             national/sector technical standards and guidelines,
-                                                 split inside into `originals\` `guides\` `pending\` `excerpts\`
-  Client regulations    `client-regulations\`    rules, notices and procedures issued by clients; a flat
-                                                 folder, one file per entry
-  Company requirements  `company-requirements\`  the company's own policies, template requirements,
-                                                 collected group notices; same as above
+  Technical standards   `standards\`             national / sector technical standards and guides,
+                                                 split further into `originals\` `guides\`
+                                                 `pending\` `excerpts\` (config standard_folders)
+  Client regulations    `client-regulations\`    regulations, notices and rules issued by clients,
+                                                 a flat folder, one file per entry
+  Company requirements  `company-requirements\`  the company's own rules, template requirements,
+                                                 distilled group notices; same as above
 
-Code and title are split from a file name like `GB_T 11836-2023 Title`; if that fails, the whole
-file name is the title -- client regulations and company requirements have no standard code,
-and should not be forced into a standard's shape.
-PDF, companion md and excerpts in `excerpts\` are matched by code. Filing into the library is
-not handled here (the standards library has its own intake check); `pending\` is listed, never moved.
+Code and title are split from file names like `XX 123-2014<<Title>>`-style names (the code,
+then the title in book-title marks); if that fails, the whole file name is the title -- client
+regulations and company requirements have no standard code and should not be forced into that
+shape. PDFs, companion md files and excerpts in the excerpts folder are matched by code. Filing
+is not handled here (the standards library has its own intake check); the pending folder is
+listed, never moved.
 
 Only three things are filled in by hand: status (current / superseded / repealed / to verify),
 scope (which stage, which kind of deliverable uses it) and notes, stored in the ledger's
-`standards` table and matched to the entry on disk by "category::file stem"; if the file on
-disk is gone, those fields stay in the ledger but are not shown in the UI.
+`standards` table and matched to the entry on disk by "category::file stem"; if the file is gone
+from disk, those words stay in the ledger but are not shown.
 
-Lives in the gate_api layer, like contacts: later an issue may record "which standards it
-satisfies"; neither gate knows about it, it knows the ledger.
+Lives in the gate_api layer, like contacts: later an issue may declare "which standards it
+meets"; neither gate knows about it, it knows the ledger.
 """
 from __future__ import annotations
 
@@ -32,39 +34,27 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from common.config import STANDARD_CATEGORIES as CATEGORIES
+from common import ledger_schema, vocab
+from common.config import active
 from outbound_gate.ledger import Ledger
 
 
-ORIGINALS = "originals"
-GUIDES = "guides"
-PENDING = "pending"
-EXCERPTS = "excerpts"
 STATUSES = ("current", "superseded", "repealed", "to verify")
 DEFAULT_STATUS = "current"
-# The hand-filled ledger fields hang on "category::file stem". The separator is :: -- it cannot
-# appear in a Windows file name, so it never mixes with the stem itself (decided when the
-# categories were split on 2026-09-21; the standards table was empty then, nothing to migrate).
+KINDS = ("standard", "guide", "regulation")
+# The hand-filled fields hang on "category::file stem". The separator is :: -- it cannot occur
+# in a Windows file name, so it never mixes with the stem (decided 2026-09-21 with the
+# categories; the standards table was empty then, nothing to migrate).
 KEY_SEP = "::"
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS standards (
-    key TEXT PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'current',
-    superseded_by TEXT NOT NULL DEFAULT '',
-    scope TEXT NOT NULL DEFAULT '',
-    notes TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL
-);
-"""
-
-# "GB_T 11836-2023 Concrete and reinforced concrete sewer pipes" -> code + title
-NAMED = re.compile(
-    r"^(?P<code>[A-Z]{1,6}(?:[_/][A-Z]{1,3})?\s*[\d.\-]+-\d{4})\s+(?P<title>\S.*?)\s*$"
-)
-# The year is the last "-four digits" in the code: `DG_TJ 08-2100-2012` is 2012, not 2100
+# "GB/T 11836-2023<<Concrete and reinforced concrete sewer pipes>>" -> code + title. The title
+# sits between the CJK book-title marks U+300A and U+300B.
+NAMED = re.compile(r"^(?P<code>[^\u300a\u300b]+?)\s*\u300a(?P<title>[^\u300a\u300b]+)\u300b\s*$")
+# The year is the last "-four digits" in the code: `DG/TJ 08-2100-2012` is 2012, not 2100
 YEAR = re.compile(r"-(\d{4})(?=\D|$)")
 DOC_SUFFIXES = (".pdf", ".md", ".docx", ".doc")
+# Full-width slash (U+FF0F), which file names use where a code has "/"
+SLASHES = "\uff0f/"
 
 
 def _now() -> str:
@@ -72,20 +62,20 @@ def _now() -> str:
 
 
 def ensure_table(ledger: Ledger) -> None:
-    with ledger.session() as connection:
-        connection.executescript(SCHEMA)
+    """The standards table is part of the ledger: create a missing ledger, check an existing one."""
+    ledger_schema.prepare(ledger.database_path)
 
 
 def compact_code(code: str) -> str:
-    """Squash a code into a comparable prefix: `GB_T 11836-2023` -> `GB11836`, `SL_T 386-2025` -> `SL386`.
-    The recommended-standard "_T" is dropped too -- excerpt folder names (`excerpt_SL386...`) leave it out."""
+    """Squeeze a code into a comparable prefix: `GB/T 11836-2023` -> `GB11836`, `SL/T 386-2025` -> `SL386`.
+    The recommended-standard "/T" goes too -- excerpt folder names do not carry it."""
     head = re.sub(r"-\d{4}(?=\D|$).*$", "", code)
-    head = re.sub(r"[_/]T(?=\s|\d)", "", head)
-    return re.sub(r"[\s_/\\\-.]", "", head).upper()
+    head = re.sub(rf"[{SLASHES}]T(?=\s|\d)", "", head)
+    return re.sub(rf"[\s{SLASHES}\\\-.]", "", head).upper()
 
 
 def _scan_docs(folder: Path, kind: str, category: str) -> list[dict]:
-    """One entry per stem (file name without extension); PDF and md each record their path."""
+    """One entry per stem (file name without extension); the PDF and the md each record a path."""
     if not folder.is_dir():
         return []
     stems: dict[str, dict] = {}
@@ -105,8 +95,8 @@ def _scan_docs(folder: Path, kind: str, category: str) -> list[dict]:
             item["md"] = str(p)
         else:
             # .doc/.docx: none in the standards library, plenty among client regulations and
-            # company requirements (2026-09-21). Listed but unopenable is as good as unlisted,
-            # so a path is recorded here too.
+            # company requirements (2026-09-21). Listed but impossible to open is as good as
+            # not listed, so record a path here too.
             item["doc"] = str(p)
     for item in stems.values():
         m = NAMED.match(item["stem"])
@@ -119,24 +109,27 @@ def _scan_docs(folder: Path, kind: str, category: str) -> list[dict]:
 
 
 def _scan_library(root: Path, category: str) -> dict:
-    """The standards library's internal structure: originals + guides, excerpts matched by code, pending listed but not moved."""
-    items = (_scan_docs(root / ORIGINALS, "standard", category)
-             + _scan_docs(root / GUIDES, "guide", category))
+    """The standards library's internal structure: originals + guides, excerpts matched by code,
+    pending listed but never moved."""
+    folders = active().standard_folders
+    items = (_scan_docs(root / folders.originals, "standard", category)
+             + _scan_docs(root / folders.guides, "guide", category))
     excerpts = []
-    folder = root / EXCERPTS
+    folder = root / folders.excerpts
     if folder.is_dir():
         excerpts = [p for p in sorted(folder.iterdir())]
+    prefix_mark = re.compile(rf"^{re.escape(active().excerpt_prefix)}[_\-\s]*")
     for item in items:
         if not item["code"]:
             continue
         prefix = compact_code(item["code"])
         for p in excerpts:
-            name = re.sub(r"^excerpt[_\-\s]*", "", p.name, flags=re.IGNORECASE)
+            name = prefix_mark.sub("", p.name)
             if compact_code(name[: len(prefix) + 4]).startswith(prefix):
                 item["excerpt"] = str(p)
                 break
     pending = []
-    folder = root / PENDING
+    folder = root / folders.pending
     if folder.is_dir():
         pending = [
             {"name": p.name, "path": str(p), "category": category}
@@ -147,8 +140,9 @@ def _scan_library(root: Path, category: str) -> dict:
 
 
 def _scan_flat(root: Path, category: str) -> dict:
-    """Flat folder: one entry per file, also reading one level of subfolders (the kind clients split by year).
-    Having no code is normal -- `compact_code` is no use here, sorting goes by file name."""
+    """A flat folder: one file per entry, one level of subfolders included too (clients that
+    split their files by year). No code is the norm -- `compact_code` is of no use, sorting
+    goes by file name."""
     items = _scan_docs(root, "regulation", category)
     if root.is_dir():
         for sub in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -159,12 +153,13 @@ def _scan_flat(root: Path, category: str) -> dict:
 
 
 def scan(root: Path, categories=None) -> dict:
-    r"""What is on disk: each of the three categories scanned on its own, merged into one list of entries carrying a category.
+    r"""What is on disk: each category scanned on its own, merged into one list of entries with a category.
 
-    `root` is `_reference\`, no longer a single standards library -- that layer is what changed on 2026-09-21.
+    `root` is the reference root, no longer a single standards library -- that layer is what
+    changed on 2026-09-21.
     """
     root = Path(root)
-    categories = list(categories or CATEGORIES)
+    categories = list(categories or active().standard_categories)
     items: list[dict] = []
     pending: list[dict] = []
     cats: list[dict] = []
@@ -177,7 +172,7 @@ def scan(root: Path, categories=None) -> dict:
         cats.append({"name": spec["name"], "folder": spec["folder"],
                      "path": str(folder), "exists": folder.is_dir(),
                      "layout": spec.get("layout", "flat"), "count": len(got["items"])})
-    # Categories in table order; within a category, standards by code, guides and regulations by name
+    # Categories in table order; within a category: standards by code, guides and regulations by name
     order = {spec["name"]: i for i, spec in enumerate(categories)}
     items.sort(key=lambda x: (order.get(x["category"], 99), x["kind"] != "standard",
                               compact_code(x["code"]) if x["code"] else "~" + x["title"]))
@@ -204,12 +199,12 @@ def list_standards(root: Path, ledger: Ledger) -> dict:
         item["scope"] = h.get("scope") or ""
         item["notes"] = h.get("notes") or ""
         item["updated_at"] = h.get("updated_at") or ""
-    # Counts per category (the line in the UI's title bar); the standards-library category splits further into standard/guide
+    # Counts per category (the line in the page header); the library category splits further
+    # into standards / guides
     data["counts"] = {c["name"]: c["count"] for c in data["categories"]}
     data["counts"]["pending"] = len(data["pending"])
     data["kinds"] = sorted({x["kind"] for x in data["items"]},
-                           key=lambda k: ("standard", "guide", "regulation").index(k)
-                           if k in ("standard", "guide", "regulation") else 9)
+                           key=lambda k: KINDS.index(k) if k in KINDS else 9)
     data["statuses"] = list(STATUSES)
     return data
 
@@ -222,16 +217,16 @@ def cmd_standards(root: Path, ledger: Ledger, payload: dict) -> dict:
 
 
 def cmd_standard_save(root: Path, ledger: Ledger, payload: dict) -> dict:
-    """Change one entry's status / superseded by / scope / notes. Only entries that exist on disk."""
+    """Change one entry's status / superseded by / scope / notes. Only entries on disk count."""
     key = str(payload.get("key") or "").strip()
     if not key:
-        raise ValueError("Missing the standard's key.")
+        raise ValueError("Missing the standard's file stem.")
     known = {x["key"] for x in scan(root)["items"]}
     if key not in known:
-        raise ValueError(f"'{key}' is not in _reference -- the index only knows what is on disk.")
+        raise ValueError(f"\"{key}\" is not in the reference folder -- the index only knows what is on disk.")
     status = str(payload.get("status") or DEFAULT_STATUS).strip()
     if status not in STATUSES:
-        raise ValueError(f"Status must be one of: {' / '.join(STATUSES)}")
+        raise ValueError(f"Status can only be: {' / '.join(STATUSES)}")
     superseded_by = str(payload.get("superseded_by") or "").strip()
     scope = str(payload.get("scope") or "").strip()
     notes = str(payload.get("notes") or "").strip()
@@ -244,7 +239,7 @@ def cmd_standard_save(root: Path, ledger: Ledger, payload: dict) -> dict:
             " ON CONFLICT(key) DO UPDATE SET status = excluded.status,"
             " superseded_by = excluded.superseded_by, scope = excluded.scope,"
             " notes = excluded.notes, updated_at = excluded.updated_at",
-            (key, status, superseded_by, scope, notes, now),
+            (key, vocab.word("status", status), superseded_by, scope, notes, now),
         )
     return {"key": key, "status": status, "superseded_by": superseded_by,
             "scope": scope, "notes": notes, "updated_at": now}

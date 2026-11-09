@@ -1,12 +1,12 @@
-"""Contacts ledger: name, company, title (optional), phone, viewed grouped by company (2026-09-03).
+"""Contacts: name, company, title (optional), phone, viewed grouped by company (2026-09-03).
 
-Lives in the gate_api layer because it feeds dropdown candidates to both gates (the intake's
-"source", the issue's "recipient"); neither gate knows about it. The table lives in the
-same ledger.db.
+Lives in the gate_api layer because it feeds dropdown suggestions to both gates at once (the
+intake's "Source", the issue's "Recipient"); neither gate knows about it. The table is in the
+same ledger.
 
-Nobody types from scratch: names that appear as intake sources or issue recipients in the
-ledger but are not registered yet are listed as "candidates" -- one click fills the form,
-add a company and a phone and it is an entry.
+Nobody types contacts from scratch: names that appear in the ledger as intake sources or issue
+recipients but are not registered yet are listed as "candidates" -- click one to fill the form,
+add a company and a phone, and it is a contact.
 """
 from __future__ import annotations
 
@@ -15,25 +15,14 @@ import sqlite3
 import uuid
 from datetime import datetime
 
+from common import ledger_schema, vocab
 from outbound_gate.ledger import Ledger
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS contacts (
-    contact_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    org TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL DEFAULT '',
-    phone TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(name, org)
-);
-"""
-
-# Cells holding several at once, like "Alice Chen, Acme Water Authority" or "Ben Zhao; Carol Wu",
-# are split and each piece counts as its own candidate
-SPLIT = re.compile(r"[,;/]+")
+# Cells holding several names ("Alice Chen, Acme Water Authority", "Ben Zhao / Carol Wu") are
+# split, each piece is a candidate. Full-width comma, enumeration comma, semicolon and slash
+# (U+FF0C U+3001 U+FF1B U+FF0F) count as separators too.
+SPLIT = re.compile(r"[\uff0c,\u3001\uff1b;\uff0f/|]+")
 
 
 def _now() -> str:
@@ -41,8 +30,8 @@ def _now() -> str:
 
 
 def ensure_table(ledger: Ledger) -> None:
-    with ledger.session() as connection:
-        connection.executescript(SCHEMA)
+    """The contacts table is part of the ledger: create a missing ledger, check an existing one."""
+    ledger_schema.prepare(ledger.database_path)
 
 
 def list_contacts(ledger: Ledger) -> list[dict]:
@@ -56,7 +45,7 @@ def list_contacts(ledger: Ledger) -> list[dict]:
 
 
 def candidates(ledger: Ledger, known: list[dict]) -> list[dict]:
-    """Names seen in the ledger but not registered yet. Sources: intake source org / source person, issue recipients."""
+    """Names seen in the ledger but not registered yet. Sources: intake source org / person, issue recipients."""
     taken = {str(c["name"]).casefold() for c in known} | {
         str(c["org"]).casefold() for c in known if c["org"]
     }
@@ -80,21 +69,23 @@ def candidates(ledger: Ledger, known: list[dict]) -> list[dict]:
         try:
             for row in connection.execute(
                 "SELECT source_org, source_person, received_date FROM intakes"
-                " WHERE status = 'filed'"
+                " WHERE status = ?",
+                (vocab.word("status", "filed"),),
             ):
                 add(row["source_org"], "intake", str(row["received_date"]))
                 add(row["source_person"], "intake", str(row["received_date"]))
         except sqlite3.OperationalError:
             pass
         for row in connection.execute(
-            "SELECT recipients, recorded_at FROM deliveries WHERE action != 'withdrawn'"
+            "SELECT recipients, recorded_at FROM deliveries WHERE action != ?",
+            (vocab.word("action", "withdrawn"),),
         ):
             add(row["recipients"], "issue", str(row["recorded_at"])[:10])
     return sorted(seen.values(), key=lambda x: (x["last"], x["times"]), reverse=True)
 
 
 def names_and_orgs(ledger: Ledger) -> tuple[list[str], list[str]]:
-    """Dropdown candidates for the two gates: registered person names and company names, one list each."""
+    """For the two gates' dropdowns: registered person names and company names, one list each."""
     rows = list_contacts(ledger)
     names = [r["name"] for r in rows]
     orgs = list(dict.fromkeys(r["org"] for r in rows if r["org"]))
@@ -110,7 +101,7 @@ def cmd_contacts(ledger: Ledger, payload: dict) -> dict:
 
 
 def cmd_contact_save(ledger: Ledger, payload: dict) -> dict:
-    """Create or edit an entry. Name is required; same name + same company is kept only once."""
+    """Create or edit one. Name is required; one row per name + company."""
     ensure_table(ledger)
     name = str(payload.get("name") or "").strip()
     org = str(payload.get("org") or "").strip()
@@ -126,7 +117,7 @@ def cmd_contact_save(ledger: Ledger, payload: dict) -> dict:
             (name, org, contact_id),
         ).fetchone()
         if clash:
-            raise ValueError(f"This contact already exists: {name} {org or '(no company)'}")
+            raise ValueError(f"This contact already exists: {name} | {org or '(no company)'}")
         if contact_id:
             cursor = connection.execute(
                 "UPDATE contacts SET name = ?, org = ?, title = ?, phone = ?, updated_at = ?"
