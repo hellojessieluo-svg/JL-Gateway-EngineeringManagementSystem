@@ -1290,8 +1290,9 @@ const FIELD_BY_LABEL = [
   ["project id", "project"], ["stage", "stage"], ["recipient", "recipient"],
   ["change notes", "selfcheck"], ["self-check notes", "selfcheck"], ["intake", "issueIntakes"],
 ];
-// Both gates have a "Subject": on the issue side the same name is a different input
-const FIELD_BY_GATE = { out: { "subject": "issueSubject" } };
+// Both gates have a "Subject": on the issue side the same name is a different input.
+// "Source" on the issue side means a source file, not an organization: no field to focus.
+const FIELD_BY_GATE = { out: { "subject": "issueSubject", "source": "" } };
 
 function focusField(id) {
   const el = $(id);
@@ -1315,8 +1316,9 @@ function showError(key, message) {
   const card = $(GATES[key].card);
   card.querySelector(".grow").textContent = message;
   card.hidden = false;
-  const named = FIELD_BY_LABEL.find(([label]) => message.includes(label));
-  if (named) focusField((FIELD_BY_GATE[key] || {})[named[0]] || named[1]);
+  const lowered = String(message).toLowerCase();
+  const named = FIELD_BY_LABEL.find(([label]) => lowered.includes(label));
+  if (named) focusField((FIELD_BY_GATE[key] || {})[named[0]] ?? named[1]);
 }
 document.querySelectorAll("[data-close]").forEach(button =>
   button.onclick = () => button.closest(".card").hidden = true);

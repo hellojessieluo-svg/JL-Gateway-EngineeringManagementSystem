@@ -42,6 +42,9 @@ It is pure Python standard library plus a single HTML page, served on `127.0.0.1
 
 Double-click [launch_gate_ui.cmd](./launch_gate_ui.cmd). It starts the background server and
 opens the page in your browser. `GATE_PORT` sets the port to listen on (default `8790`).
+It looks for Python in this order: the folder named by `GATE_PYTHON`, a portable
+`runtime\python` next to the app folder, the per-user installs of Python 3.14 / 3.13 / 3.12,
+then `pyw` / `pythonw` / `py` on `PATH`.
 
 **Run the tests**
 
