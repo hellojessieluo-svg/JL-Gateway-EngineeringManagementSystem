@@ -9,8 +9,10 @@ if not defined GATE_PORT set "GATE_PORT=8790"
 set "GATE_ARGS=%GATE_PORT% %*"
 
 rem Runtime search order: GATE_PYTHON (a folder holding python.exe / pythonw.exe),
-rem then the default per-user installs, then the py launcher / pythonw on PATH.
+rem then a portable runtime\python next to the app folder, then the default
+rem per-user installs, then the py launcher / pythonw on PATH.
 set "RUNTIME_1=%GATE_PYTHON%"
+set "RUNTIME_P=%APP_DIR%..\runtime\python"
 set "RUNTIME_2=%LOCALAPPDATA%\Programs\Python\Python314"
 set "RUNTIME_3=%LOCALAPPDATA%\Programs\Python\Python313"
 set "RUNTIME_4=%LOCALAPPDATA%\Programs\Python\Python312"
@@ -18,6 +20,7 @@ set "RUNTIME_4=%LOCALAPPDATA%\Programs\Python\Python312"
 pushd "%APP_DIR%"
 
 if defined GATE_PYTHON call :try "%RUNTIME_1%" && goto :ok
+call :try "%RUNTIME_P%" && goto :ok
 call :try "%RUNTIME_2%" && goto :ok
 call :try "%RUNTIME_3%" && goto :ok
 call :try "%RUNTIME_4%" && goto :ok
