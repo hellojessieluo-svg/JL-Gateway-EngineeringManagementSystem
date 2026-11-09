@@ -1,17 +1,20 @@
 # Gateway - guide for AI agents changing this repo
 
 **This repo is the tool, not the files.** The tool lives here; the files it manages live in a
-work library -- a row of project rooms. The library spec (the floor plan) is
-[docs/library-spec.md](./docs/library-spec.md). A real deployment keeps its spec inside the
-library at `<library>\_admin\library-spec.md` (`common.config.DEFAULT_SPEC_PATH`);
-[examples/library/_admin/library-spec.md](./examples/library/_admin/library-spec.md) is a copy.
+work library -- a row of project rooms. The library spec (the floor plan) lives inside the
+library, in its own admin folder: by default `<library>\_admin\library-spec.md`
+(`config.spec_path`; since 2026-09-23 the spec lives in the admin folder, and the library root's
+`README.md` is only a pointer). An English example is [docs/library-spec.md](./docs/library-spec.md),
+and [examples/library/](./examples/library/) is a starter admin folder with the spec and the three
+templates.
 **Read the spec before touching this repo**, otherwise you will be changing the program that
 decides where things go without knowing where things go.
 What was cut and why is in "What we cut" below -- don't let cut things grow back; this file and
 the README only describe the present.
 
 The rooms in one line: one room per project, stage folders inside the room, and the positions
-all hang under the stage (redesigned 2026-08-20).
+all hang under the stage (redesigned 2026-08-20). The names below are the defaults; every one
+of them comes from the local config.
 
 ```text
 <short name>\<stage>\inbox\ -> <short name>\<stage>\current\ -> <short name>\<stage>\outbox\
@@ -23,8 +26,8 @@ all hang under the stage (redesigned 2026-08-20).
 `outbox\<date-recipient-subject>\` (the "subject" was added on 2026-09-11; before that it was only
 `date-recipient`, and from the folder name you could not tell apart two batches sent to the same
 person on the same day).
-**All old batches were renamed the same day**: 60 batches got a subject through `issue-subject`
-and were renamed; the subject was inferred from the incoming item's subject, the topic in the old
+**All old batches were renamed the same day**: they got a subject through `issue-subject` and
+were renamed; the subject was inferred from the incoming item's subject, the topic in the old
 folder name, then the notes, in that order, and recorded after a person had reviewed it.
 The subject is a short, optional field and is not the same thing as the full-sentence "notes"
 in the ledger: notes only go into the ledger.
@@ -63,8 +66,10 @@ constraint were removed from `issues` (`versions.py` was deleted). **The ledger 
 on 2026-09-03**: `issues` now only has `file_name/file_stem/file_path/file_hash` to describe the
 file, with no `package_*`, `section`, `task_id`, `after_commit_id` or `content_signature`; the
 `pools/commits/tasks` tables and the like are gone.
-Old ledgers are rebuilt by `Ledger._rebuild_legacy` the first time they are opened (a
-`-backup.db` is saved first).
+**The ledger is opened check-only** (2026-11-09): a missing ledger file is created with every
+table (`common.ledger_schema.prepare`); an existing one is only compared with the expected tables
+and columns, and if anything is missing the program stops with an error and changes nothing --
+no rebuild, no column backfill, no migration.
 Which version a file is, is something people say in the file name; the program only records
 "this file, this stage, issued once on this day"; the same file name can be issued again and
 again, told apart by issue date and batch folder;
@@ -84,9 +89,9 @@ back to the built-in skeleton in `common/constants.py` -- both go through
 page drafts from it when empty. Gate matters are delivered by the task card; a project room's
 `AGENTS.md` only covers the project itself and does not repeat issue rules.
 **Drafts live in `_drafts\<id>-<stage>-change-notes.md` at the library root** (moved from the
-desktop on 2026-09-26; `places.DRAFT_FOLDER`). Once an issue is filed and the copy in the batch
+desktop on 2026-09-26; `places.draft_dir`). Once an issue is filed and the copy in the batch
 matches byte for byte, the program deletes the draft (`cli._consume_draft`); it only deletes
-drafts in `_drafts\`, never an `.md` picked from elsewhere.
+drafts in the drafts folder, never an `.md` picked from elsewhere.
 `_drafts\` and `.tmp\` (the gates' copy area, should always be empty) are different things; the
 health check treats both as library admin.
 
@@ -98,19 +103,36 @@ page has a checkbox per row, and the list counts "sent N, kept M".
 Old batches get the mark through `issue-role`. Don't grow a folder level for kept files -- the
 explicit requirement is "stored together".
 
+**Agent auto-filing** (2026-11-09): when the person says a result is final ("this is the
+version", "I sent it", "issue it") or says "log this intake", that sentence is the confirmation
+and the agent calls `issue-auto` / `intake-auto` directly -- **no listing first and waiting for a
+nod** (the trigger rules live in the agent's own instructions, not in this repo). Whatever cannot
+be derived for sure -- project and stage, which incoming item to link, a missing intake source --
+is an error that makes the agent ask; the program never guesses. **There is one ledger and no
+automatic backup** (see "What we cut"). The safeguard is in `gate_api/autofile.py`: a three-way
+hash check after filing; if it fails, the answer has `verified: false` plus an `alert`. The ledger
+records `deliveries.auto` / `intakes.auto`, and the dashboard's "Recent auto-filed" block has one
+"Withdraw" per row. The same day `relink-issue` became append by default; `mode: "replace"` is the
+old behavior.
+
+**Issue formats are wide open** (2026-11-09): `STRUCTURE_CHECKED_EXTENSIONS` in
+`common/constants.py` (formerly `ALLOWED_EXTENSIONS`) only decides whether a structural check
+runs and turns nobody away; still refused are only `~$` temp files, `.bak`/`.sv$` and 0-byte
+files. Within one batch, duplicates are judged by the **full file name**.
+
 **On a ledger/disk mismatch, the disk wins** (2026-08-29): inbox and outbox are add-only in name,
 but in practice people add files by hand, save in place, and move things around. Don't delete
 people's files to fit the ledger -- `intake-resync` / `issue-resync` rescan the folders and fix the
-books, `selfcheck-rename` normalizes the change notes in old batches to `change-notes.md`, and
-`issue-subject` fills in the subject for old issue batches and renames their folders to the new
-shape (renaming folders is the program's job; a clash gets -2).
+books, `selfcheck-rename` normalizes the change notes in old batches to the configured
+change-notes name, and `issue-subject` fills in the subject for old issue batches and renames
+their folders to the new shape (renaming folders is the program's job; a clash gets -2).
 All four are dry runs by default; they only act with `apply=true`.
 
 **Registered project stages** (2026-08-30): `projects.stages` stores which stages a project
-actually has (joined with `,`), and both gates' stage dropdowns filter by it. It is a filter, not a
-gate -- the dropdown keeps a "+ Other stage..." option, and choosing it registers the stage
-automatically (`gate_api.cli._remember_stage`). The initial values of this column were derived
-from the ledger, not entered by a person.
+actually has (joined with the configured `stage_separator`, default `,`), and both gates' stage
+dropdowns filter by it. It is a filter, not a gate -- the dropdown keeps a "+ Other stage..."
+option, and choosing it registers the stage automatically (`gate_api.cli._remember_stage`). The
+initial values of this column were derived from the ledger, not entered by a person.
 
 ## What we cut
 
@@ -128,6 +150,13 @@ New cuts get a new row.
 | The "Archive" checkbox adding an `archive\` folder level | 2026-09-08 | A checkbox is a mark, not a location; the only such level was flattened |
 | The program packing zips for you | 2026-08-15 | You pack the archive; the program does not pack it for you |
 | A second instance for a stage-less personal library (with its stage-less mode, the `GATE_CONFIG` switch, per-instance colors and program name) | decided 2026-09-23, removed 09-26 | Zero usage: 0 intake and 0 issues between 09-07 and 09-23 |
+| The issue format allow-list (the half that refused files by extension) | 2026-11-09 | It blocked real deliverables such as png, jpg, html and json, and an agent could only get around it by zipping or converting to PDF; the table stays, but only decides whether a structural check runs |
+| An agent listing intake/issue entries and waiting for a nod before filing them | 2026-11-09 | Sending first and logging later had become the norm, and the confirmation step turned logging into something nobody did, leaving incoming items open; now saying it files it, and withdrawal is the safety net |
+| Duplicate check within a batch by file stem | 2026-11-09 | `X.dwg` plus `X.pdf` in one batch folder never conflicted but was refused, so people zipped to get around it |
+| Backing up the ledger before auto-filing (a local rotation of 10 copies, then a single snapshot in a synced folder) | 2026-11-09 | What is wanted is one ledger; a backup is one more thing to look after, and the rotation, which recognized backups by name, once deleted hand-made backups. Filing runs in a transaction and a wrong entry can be withdrawn; that is enough. Don't leave `-backup` files lying around |
+| Automatic ledger migration on open (the one-off rebuild of pre-2026-09-03 ledgers, `ALTER TABLE` column backfills, writing schema versions on every open) | 2026-11-09 | A program that rewrites a ledger just by opening it can damage records nobody asked it to touch. The English edition opens ledgers check-only: create a missing one, otherwise compare and stop with an error |
+| The legacy temporary-ID prefix (a non-ASCII prefix that predated `TMP-`) | 2026-11-09 | `TMP-` has been the prefix since 2026-08-30 (IDs end up in file names, command lines and folder names, where non-ASCII needs coaxing); the old one was still recognized only so new numbers would not collide with it. A ledger that still holds such IDs moves them to official IDs with `project-bind` |
+| Hard-coded on-disk names (folder names, file names, stage list, ledger words spelled in code) | 2026-11-09 | An existing library with other names could only be run by renaming it. Every name now comes from the config, and code must never spell a folder or file name of the library |
 
 - **The reasons for not doing something are worth more than the reasons for doing it, and cut
   things must not quietly grow back**: cut features based on usage data, and when something is
@@ -135,23 +164,39 @@ New cuts get a new row.
 
 ## Repo structure
 
-`README.md` is the full version; here are only three things that are easy to trip over:
+`README.md` is the full version; here are only the things that are easy to trip over:
 
 1. **The two gates never import each other's business logic**; they are connected through the
-   ledger `<library>\ledger.db` (`intakes.replies_to` points at `issues`). To see dependencies,
-   look at the data flow -- don't draw architectural conclusions from imports.
+   ledger (`<library>\ledger.db` by default; `intakes.replies_to` points at `issues`). To see
+   dependencies, look at the data flow -- don't draw architectural conclusions from imports.
 2. **Shared tools live in `common\`** (`errors.py` `naming.py` `validators.py` `constants.py`
-   `places.py` `config.py`, moved out of `outbound_gate\` on 2026-09-03). `common` imports no
-   gate; both gates import it. **If you change this toolbox, run both gates' tests.**
+   `places.py` `config.py` `vocab.py` `ledger_schema.py`; the first six moved out of
+   `outbound_gate\` on 2026-09-03). `common` imports no gate; both gates import it. **If you
+   change this toolbox, run both gates' tests.**
    The address algorithm is in `common/places.py`: project ID -> `projects.folder` (short name)
    -> the room's positions.
    Reading and writing the project registry (`Ledger`) is still in `outbound_gate/ledger.py`.
-3. **`gate_api` knows both gates; neither gate knows `gate_api`.** Dependencies point one way.
+3. **All path computing goes through `common.places` / config.** Code never spells a folder or
+   file name of the library: ask `places.names()` (inbox, current, outbox, archive, tools,
+   withdrawn, general, drafts, admin, templates, health_checks, reference), `places.files()`
+   (ledger, spec, change_notes, project_template, stage_template, health_report_prefix),
+   `places.stages()` / `split_stages` / `join_stages` / `fallback_stage`, the directory helpers
+   (`draft_dir`, `template_dir`, `health_check_dir`, `admin_dir`), or `config.active()` for the
+   rest. User-facing messages name positions in plain words ("the current folder") or
+   interpolate the configured name.
+4. **Ledger values are program words in Python, ledger words in SQL** (`common/vocab.py`).
+   Rows read through a `Ledger` / `IntakeLedger` session (`common.ledger_schema.connect`) already
+   come back in program words for `status`, `intake_status`, `role`, `action`, `purpose`,
+   `source_channel` and `channels_json`; every SQL literal or parameter compared with or written
+   into those columns goes through `vocab.word(...)` / `vocab.channels_json(...)`. Never open the
+   ledger with `sqlite3.connect` yourself, and never add CREATE/ALTER/DROP statements: the ledger
+   is opened check-only.
+5. **`gate_api` knows both gates; neither gate knows `gate_api`.** Dependencies point one way.
    The contacts ledger (`gate_api/contacts.py`, 2026-09-03) also lives in this layer: it feeds
    dropdown candidates to both gates, and neither gate knows about it. The library health check
    (`gate_api/library_check.py`, 2026-09-05) likewise: it is the executable version of section 9
-   of the library spec (the text lives in the library's `_admin\`,
-   `common.config.DEFAULT_SPEC_PATH`); if you change the spec, change it too.
+   of the library spec (the text lives in the library's admin folder, `config.spec_path`); if you
+   change the spec, change it too.
    There is only one spec, and `read_spec` returns it (as `charter`); the UI's "Charter" tab shows
    it read-only -- edit the file itself.
    The three templates in `_admin\templates\` are its business too (`TEMPLATE_NAMES` /
@@ -164,8 +209,9 @@ New cuts get a new row.
    **Since 2026-09-21 there are three parallel categories**: `standards\` (technical standards,
    internally split into originals / guides / pending / excerpts), `client-regulations\` and
    `company-requirements\` (the last two are flat folders, one file per entry, no codes). The
-   category table is `STANDARD_CATEGORIES` in `common/config.py`, the config key is
-   `reference_root`; the `standards` table's primary key is "category::file stem".
+   category table is the config key `standard_categories` (`DEFAULT_STANDARD_CATEGORIES` in
+   `common/config.py`), the root is `reference_root`; the `standards` table's primary key is
+   "category::file stem".
 
 ## Running the tests
 
@@ -173,7 +219,10 @@ New cuts get a new row.
 python -m unittest discover
 ```
 
-Python standard library only -- don't add dependencies.
+Python 3.12+ and the standard library only -- don't add dependencies. pypdf is optional (PDF
+page counts), `tkinter` is used for the native file picker, and Pillow is only needed by
+`tools/build_icon.py`. The tests point `LOCALAPPDATA` at a temporary folder (`tests/__init__.py`),
+so they never read the machine's real config.
 
 ## Three pitfalls that bite
 
@@ -196,5 +245,6 @@ Python standard library only -- don't add dependencies.
 ## After a change
 
 Verify UI changes in a browser (if the server is already running, just reload the page).
-If you changed the spatial structure, update the library spec
-([docs/library-spec.md](./docs/library-spec.md) and its copy in `examples/library/_admin/`) to match.
+If you changed the spatial structure, update the library spec to match (the library's own
+`_admin\library-spec.md`, which is for people, plus [docs/library-spec.md](./docs/library-spec.md)
+and its copy in `examples/library/_admin/`).
