@@ -110,7 +110,7 @@ class LocalizedLibraryTests(unittest.TestCase):
         # Intake on two stages, the second one by the agent command
         first = cli.cmd_intake_archive(self.payload(
             project_id=project_id, project_name=sample["project_name"],
-            source_org=sample["source_org"], source_channel="Paper scan",
+            source_org=sample["source_org"], source_channel=self.words["source_channel"]["Paper scan"],
             received_date="2026-11-01", subject=sample["subject"], stage=self.stage(1),
             todo=True,
             items=[{"path": str(self.write_pdf(self.sources, "a.pdf", b"a"))}],

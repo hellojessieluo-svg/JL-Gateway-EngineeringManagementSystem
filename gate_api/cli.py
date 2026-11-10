@@ -521,7 +521,7 @@ def cmd_intake_archive(payload: dict) -> dict:
         project_name=payload.get("project_name", ""),
         source_org=payload.get("source_org", ""),
         source_person=payload.get("source_person", ""),
-        source_channel=payload.get("source_channel", ""),
+        source_channel=vocab.program_word("source_channel", payload.get("source_channel", "")),
         received_date=_parse_date(payload.get("received_date", ""), "Received date"),
         subject=payload.get("subject", ""),
         items=items,
@@ -850,7 +850,7 @@ def cmd_issue_create(payload: dict) -> dict:
     gate = _outbound(payload)
     # Each item may carry a role (sent / kept), default "sent" (2026-09-22)
     items = [
-        SourceItem(item["path"], role=str(item.get("role") or "sent"))
+        SourceItem(item["path"], role=vocab.program_word("role", str(item.get("role") or "sent")))
         for item in payload.get("items") or []
     ]
     request = IssueRequest(
@@ -858,8 +858,9 @@ def cmd_issue_create(payload: dict) -> dict:
         project_name=payload.get("project_name", ""),
         stage=payload.get("stage", ""),
         issue_date=_parse_date(payload.get("issue_date", ""), "Issue date"),
-        purpose=payload.get("purpose") or DEFAULT_PURPOSE,
-        channels=payload.get("channels") or [],
+        # Callers may pass the ledger's own words (common.vocab); read them as program words
+        purpose=vocab.program_word("purpose", payload.get("purpose") or DEFAULT_PURPOSE),
+        channels=[vocab.program_word("channel", str(x)) for x in payload.get("channels") or []],
         archived=bool(payload.get("archived")),
         recipients=payload.get("recipients", ""),
         subject=payload.get("subject", ""),
