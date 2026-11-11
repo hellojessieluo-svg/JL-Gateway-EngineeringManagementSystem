@@ -104,6 +104,16 @@ class AutoFilingTests(unittest.TestCase):
         detail = cli.cmd_issue_detail(self.payload(issue_id=out["files"][0]["issue_id"]))
         self.assertTrue(detail["issue"]["auto"])
 
+    def test_recipients_given_as_a_list_are_joined(self) -> None:
+        self.intake("comments", b"a")
+        drawing = self.dwg(self.pool, "site-plan.dwg", b"v2")
+        self.draft()
+        out = cli.cmd_issue_auto(
+            self.payload(files=[str(drawing)], subject="entrance change", recipients=["Carol Wu", "Dan Li"])
+        )
+        self.assertEqual(out["recipients"], "Carol Wu,Dan Li")
+        self.assertNotIn("[", Path(out["files"][0]["path"]).parent.name)
+
     def test_verify_catches_a_tampered_copy(self) -> None:
         self.intake("comments", b"a")
         drawing = self.dwg(self.pool, "site-plan.dwg", b"v2")

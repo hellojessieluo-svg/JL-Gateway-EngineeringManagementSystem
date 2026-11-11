@@ -1067,7 +1067,10 @@ def cmd_issue_auto(payload: dict) -> dict:
     if first is None:
         raise ValueError(f"The intake to link is not in the ledger: {intake_ids[0]}")
 
-    recipients = str(payload.get("recipients") or "").strip() or str(
+    given = payload.get("recipients")
+    if isinstance(given, (list, tuple)):
+        given = config.stage_separator.join(str(x).strip() for x in given if str(x).strip())
+    recipients = str(given or "").strip() or str(
         first["source_person"] or first["source_org"] or ""
     )
     # An agent may pass the ledger's own words (common.vocab); read them as program words
